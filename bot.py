@@ -133,13 +133,13 @@ async def receive_count(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             InlineKeyboardButton("24 words  (most secure)", callback_data="24"),
         ],
     ]
-    await update.message.reply_text(
-        f"✅ *{count:,} wallets* selected\\.\n\n"
-        "Choose your *mnemonic phrase length*:\n\n"
-        "_Longer phrase = higher entropy = more secure_",
-        parse_mode=ParseMode.MARKDOWN_V2,
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
+await update.message.reply_text(
+    f"✅ *{count:,} wallets* selected\\.\n\n"
+    "Choose your *mnemonic phrase length*:\n\n"
+    "_Longer phrase \= higher entropy \= more secure_",
+    parse_mode=ParseMode.MARKDOWN_V2,
+    reply_markup=InlineKeyboardMarkup(keyboard),
+)
     return ASK_WORDS
 
 

@@ -132,7 +132,7 @@ HELP_TEXT = (
     "• Wallets use BIP\\-44 standard derivation\n"
     "• Compatible with MetaMask, Trust Wallet, Rabby, Bitget, etc\\.\n"
     "• Store your wallet data in an encrypted location\n"
-    "• Never share your private keys or mnemonic phrases\n\n"
+    "• Never share your mnemonic phrases\n\n"
     f"*Batch limit:* {MAX_WALLETS:,} wallets per request"
 )
 
@@ -170,7 +170,11 @@ def generate_batch(start_idx: int, end_idx: int, word_count: int) -> list:
     for i in range(start_idx, end_idx):
         phrase = mnemo.generate(strength=strength)
         acct = Account.from_mnemonic(phrase, account_path=DERIVATION_PATH)
-        results.append([i + 1, acct.address, acct.key.hex(), phrase])
+        # NOTE: private key is intentionally NOT included anywhere (CSV or TG).
+        # Only address + mnemonic are stored/delivered. The wallet's private
+        # key can always be re-derived from the mnemonic inside the user's
+        # own wallet app (MetaMask, Trust Wallet, etc.) when needed.
+        results.append([i + 1, acct.address, phrase])
     return results
 
 
@@ -196,7 +200,7 @@ def write_csv(rows: list) -> str:
     )
     try:
         writer = csv.writer(tmp)
-        writer.writerow(["#", "address", "private_key", "mnemonic"])
+        writer.writerow(["#", "address", "mnemonic"])
         writer.writerows(rows)
         tmp.flush()
     finally:
@@ -208,11 +212,10 @@ def format_tg_chunk(rows_chunk: list) -> str:
     """Formats up to WALLETS_PER_TG_MESSAGE wallets as one MarkdownV2 message."""
     lines = []
     for row in rows_chunk:
-        idx, address, pk, mnemonic = row
+        idx, address, mnemonic = row
         lines.append(
             f"*\\#{idx}*\n"
             f"Address: `{address}`\n"
-            f"Private Key: `{pk}`\n"
             f"Mnemonic: `{mnemonic}`"
         )
     return "\n\n".join(lines)
@@ -457,10 +460,10 @@ async def deliver_csv(query, rows: list, count: int) -> None:
                 caption=(
                     f"✅ *{count:,} wallets generated*\n\n"
                     f"📄 File: `{filename}`\n"
-                    f"🔑 Columns: `#`, `address`, `private_key`, `mnemonic`\n\n"
+                    f"🔑 Columns: `#`, `address`, `mnemonic`\n\n"
                     "⚠️ *Security reminder*\n"
                     "Store this file in an encrypted location\\. "
-                    "Never share your private keys or mnemonic phrases\\."
+                    "Never share your mnemonic phrases\\."
                 ),
                 parse_mode=ParseMode.MARKDOWN_V2,
             )
@@ -502,7 +505,7 @@ async def deliver_tg_messages(query, context, rows: list, count: int) -> None:
 
     await query.message.reply_text(
         "⚠️ *Security reminder*\n"
-        "Never share your private keys or mnemonic phrases\\.",
+        "Never share your mnemonic phrases\\.",
         parse_mode=ParseMode.MARKDOWN_V2,
     )
 

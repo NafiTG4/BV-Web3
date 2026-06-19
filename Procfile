@@ -1,1 +1,1 @@
-worker: python wallet_gen_bot.py
+worker: python bot.py

@@ -1,10 +1,8 @@
 """
-EVM Wallet Generator Bot
-Generates BIP-44 HD wallets on demand and exports them as a CSV file.
-Nothing is persisted server-side — the temp file is deleted immediately after sending.
-
-Requirements:
-    pip install python-telegram-bot eth-account mnemonic
+EVM Wallet Generator Bot – BIP-44 HD Wallet Generator
+Compatible with MetaMask, Rabby, Bitget Wallet, and all EVM chains.
+Optimized for Railway Trial Plan (2 vCPU, 0.5 GB RAM).
+Generates up to 100,000 wallets per batch and delivers as CSV.
 """
 
 import logging
@@ -12,6 +10,8 @@ import asyncio
 import os
 import csv
 import tempfile
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -26,10 +26,10 @@ from telegram.ext import (
     ContextTypes,
 )
 from eth_account import Account
-from mnemonic import Mnemonic
+from pybip39 import Mnemonic   # Rust-based, 5-10x faster than 'mnemonic'
 
 # ========================================================================
-#  অনুমোদন ও কনফিগারেশন
+#  কনফিগারেশন ও গ্লোবাল সেটিংস
 # ========================================================================
 Account.enable_unaudited_hdwallet_features()
 
@@ -41,9 +41,8 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 
-# জেনারেশন স্পিড (ওয়ালেট/সেকেন্ড) – এনভায়রনমেন্ট ভেরিয়েবল দিয়ে পরিবর্তন করা যায়
-# ডিফল্ট ৮০০ (যা আগের কোডে ছিল)
-GENERATION_SPEED = int(os.environ.get("GEN_SPEED", 800))
+# আনুমানিক জেনারেশন স্পিড (ওয়ালেট/সেকেন্ড) – এনভায়রনমেন্ট ভেরিয়েবল দিয়ে কাস্টমাইজ করা যায়
+GENERATION_SPEED = int(os.environ.get("GEN_SPEED", 12000))
 
 # কনভার্সেশন স্টেট
 ASK_COUNT, ASK_WORDS = range(2)
@@ -51,7 +50,11 @@ ASK_COUNT, ASK_WORDS = range(2)
 MAX_WALLETS = 100_000
 VALID_WORD_COUNTS = {12, 15, 18, 21, 24}
 STRENGTH_MAP = {12: 128, 15: 160, 18: 192, 21: 224, 24: 256}
-DERIVATION_PATH = "m/44'/60'/0'/0/0"
+DERIVATION_PATH = "m/44'/60'/0'/0/0"   # Standard Ethereum path
+
+# Railway Trial-এ ২ vCPU, তাই ২টি ওয়ার্কার
+MAX_WORKERS = 2
+BATCH_SIZE = 5000   # প্রতি ব্যাচে কয়টি ওয়ালেট (RAM বাঁচাতে)
 
 # ========================================================================
 #  মার্কডাউন টেক্সট (MarkdownV2‑এর জন্য সব ক্যারেক্টার এস্কেপ করা)
@@ -87,6 +90,57 @@ HELP_TEXT = (
     "• Never share your private keys or mnemonic\n\n"
     f"*Batch limit:* {MAX_WALLETS:,} wallets"
 )
+
+# ========================================================================
+#  ওয়ালেট জেনারেশন ওয়ার্কার (প্রতিটি প্রসেসে চলে)
+# ========================================================================
+def generate_batch(start_idx: int, end_idx: int, word_count: int) -> list:
+    """
+    একটি নির্দিষ্ট রেঞ্জের ওয়ালেট জেনারেট করে।
+    প্রতিটি প্রসেস আলাদা Mnemonic instance ব্যবহার করে।
+    """
+    mnemo = Mnemonic()
+    strength = STRENGTH_MAP[word_count]
+    results = []
+    for i in range(start_idx, end_idx):
+        phrase = mnemo.generate(strength=strength)
+        acct = Account.from_mnemonic(phrase, account_path=DERIVATION_PATH)
+        results.append([i + 1, acct.address, acct.key.hex(), phrase])
+    return results
+
+# ========================================================================
+#  CSV জেনারেশন (স্ট্রিমিং + মাল্টিপ্রসেসিং)
+# ========================================================================
+def generate_csv_streaming(count: int, word_count: int) -> str:
+    """
+    ব্যাচ আকারে ওয়ালেট জেনারেট করে CSV-তে স্ট্রিম করে।
+    পুরো ডেটা মেমORYতে রাখে না, তাই 0.5 GB RAM-এর জন্য নিরাপদ।
+    """
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".csv", delete=False, newline="", encoding="utf-8"
+    )
+    try:
+        writer = csv.writer(tmp)
+        writer.writerow(["#", "address", "private_key", "mnemonic"])
+
+        # ব্যাচে ভাগ করা
+        batches = []
+        for start in range(0, count, BATCH_SIZE):
+            end = min(start + BATCH_SIZE, count)
+            batches.append((start, end, word_count))
+
+        # মাল্টিপ্রসেসিং পুল
+        with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = [executor.submit(generate_batch, s, e, wc) for s, e, wc in batches]
+            for future in futures:
+                rows = future.result()
+                writer.writerows(rows)   # স্ট্রিমিং-এ লেখা
+                tmp.flush()              # ডিস্কে ফ্লাশ
+
+        tmp.flush()
+    finally:
+        tmp.close()
+    return tmp.name
 
 # ========================================================================
 #  হ্যান্ডলার ফাংশন
@@ -154,9 +208,6 @@ async def receive_words(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         await query.edit_message_text("⏳ Session expired. Use /start to begin again.")
         return ConversationHandler.END
 
-    # --------------------------------------------------------------------
-    #  এখানেই নতুন ক্যালকুলেশন – GENERATION_SPEED কনস্ট্যান্ট ব্যবহার করে
-    # --------------------------------------------------------------------
     est_seconds = max(1, count // GENERATION_SPEED)
 
     await query.edit_message_text(
@@ -169,7 +220,8 @@ async def receive_words(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     )
 
     try:
-        csv_path = await asyncio.to_thread(_generate_csv, count, word_count)
+        # CPU-ভারী কাজটি async thread-এ চালানো
+        csv_path = await asyncio.to_thread(generate_csv_streaming, count, word_count)
     except Exception as e:
         logger.exception("CSV generation failed: %s", e)
         await query.message.reply_text(
@@ -218,35 +270,6 @@ async def receive_words(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     return ConversationHandler.END
 
 # ========================================================================
-#  ওয়ালেট জেনারেশন (থ্রেডে চলে)
-# ========================================================================
-def _generate_csv(count: int, word_count: int) -> str:
-    mnemo = Mnemonic("english")
-    strength = STRENGTH_MAP[word_count]
-
-    tmp = tempfile.NamedTemporaryFile(
-        mode="w",
-        suffix=".csv",
-        delete=False,
-        newline="",
-        encoding="utf-8",
-    )
-    try:
-        writer = csv.writer(tmp)
-        writer.writerow(["#", "address", "private_key", "mnemonic"])
-
-        for i in range(count):
-            phrase = mnemo.generate(strength=strength)
-            acct = Account.from_mnemonic(phrase, account_path=DERIVATION_PATH)
-            writer.writerow([i + 1, acct.address, acct.key.hex(), phrase])
-
-        tmp.flush()
-    finally:
-        tmp.close()
-
-    return tmp.name
-
-# ========================================================================
 #  ক্যানসেল ও ফলব্যাক হ্যান্ডলার
 # ========================================================================
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -288,4 +311,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-                        

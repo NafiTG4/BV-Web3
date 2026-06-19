@@ -2,9 +2,6 @@
 EVM Wallet Generator Bot
 Generates BIP-44 HD wallets on demand and exports them as a CSV file.
 Nothing is persisted server-side — the temp file is deleted immediately after sending.
-
-Requirements:
-    pip install python-telegram-bot eth-account mnemonic
 """
 
 import logging
@@ -38,26 +35,21 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 
-# Conversation states
 ASK_COUNT, ASK_WORDS = range(2)
-
 MAX_WALLETS = 100_000
 VALID_WORD_COUNTS = {12, 15, 18, 21, 24}
-
-# BIP-39 entropy bits per word count
 STRENGTH_MAP = {12: 128, 15: 160, 18: 192, 21: 224, 24: 256}
-
-# BIP-44 derivation path for EVM chains
 DERIVATION_PATH = "m/44'/60'/0'/0/0"
 
+# সব MarkdownV2-এস্কেপ করা টেক্সট (এমোজি বাদ)
 WELCOME_TEXT = (
     "*EVM Wallet Generator*\n"
     "━━━━━━━━━━━━━━━━━━━━\n\n"
     "Generates BIP\\-44 HD wallets compatible with all EVM chains "
     "\\(Ethereum, BSC, Polygon, Arbitrum, etc\\.\\)\n\n"
-    "🔒 *Privacy:* Nothing is stored on the server\\. "
+    "*Privacy:* Nothing is stored on the server\\. "
     "Your CSV is deleted immediately after delivery\\.\n\n"
-    f"📦 *Limit:* Up to {MAX_WALLETS:,} wallets per batch\n\n"
+    f"*Limit:* Up to {MAX_WALLETS:,} wallets per batch\n\n"
     "How many wallets do you need?"
 )
 
@@ -82,29 +74,16 @@ HELP_TEXT = (
     f"*Batch limit:* {MAX_WALLETS:,} wallets"
 )
 
-
-# --------------------------------------------------------------------------- #
-# /start
-# --------------------------------------------------------------------------- #
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
     await update.message.reply_text(WELCOME_TEXT, parse_mode=ParseMode.MARKDOWN_V2)
     return ASK_COUNT
 
-
-# --------------------------------------------------------------------------- #
-# /help
-# --------------------------------------------------------------------------- #
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(HELP_TEXT, parse_mode=ParseMode.MARKDOWN_V2)
 
-
-# --------------------------------------------------------------------------- #
-# Receive wallet count
-# --------------------------------------------------------------------------- #
 async def receive_count(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = update.message.text.strip()
-
     if not text.isdigit():
         await update.message.reply_text(
             "⚠️ *Invalid input*\n\nPlease enter a number\\. Example: `1000`",
@@ -133,19 +112,15 @@ async def receive_count(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             InlineKeyboardButton("24 words  (most secure)", callback_data="24"),
         ],
     ]
-await update.message.reply_text(
-    f"✅ *{count:,} wallets* selected\\.\n\n"
-    "Choose your *mnemonic phrase length*:\n\n"
-    "_Longer phrase \= higher entropy \= more secure_",
-    parse_mode=ParseMode.MARKDOWN_V2,
-    reply_markup=InlineKeyboardMarkup(keyboard),
-)
+    await update.message.reply_text(
+        f"✅ *{count:,} wallets* selected\\.\n\n"
+        "Choose your *mnemonic phrase length*:\n\n"
+        "_Longer phrase \\= higher entropy \\= more secure_",
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
     return ASK_WORDS
 
-
-# --------------------------------------------------------------------------- #
-# Receive word count, generate CSV, send file
-# --------------------------------------------------------------------------- #
 async def receive_words(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
@@ -170,7 +145,6 @@ async def receive_words(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         parse_mode=ParseMode.MARKDOWN_V2,
     )
 
-    # Run CPU-bound generation in a thread — keeps the event loop free
     try:
         csv_path = await asyncio.to_thread(_generate_csv, count, word_count)
     except Exception as e:
@@ -208,7 +182,6 @@ async def receive_words(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             parse_mode=ParseMode.MARKDOWN_V2,
         )
     finally:
-        # Always wipe the temp file regardless of send success/failure
         try:
             os.remove(csv_path)
         except OSError:
@@ -221,15 +194,10 @@ async def receive_words(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     )
     return ConversationHandler.END
 
-
-# --------------------------------------------------------------------------- #
-# Wallet generation + streaming CSV write (runs in thread)
-# --------------------------------------------------------------------------- #
 def _generate_csv(count: int, word_count: int) -> str:
     mnemo = Mnemonic("english")
     strength = STRENGTH_MAP[word_count]
 
-    # Stream-write to disk — avoids holding 100k wallet dicts in RAM simultaneously
     tmp = tempfile.NamedTemporaryFile(
         mode="w",
         suffix=".csv",
@@ -240,22 +208,15 @@ def _generate_csv(count: int, word_count: int) -> str:
     try:
         writer = csv.writer(tmp)
         writer.writerow(["#", "address", "private_key", "mnemonic"])
-
         for i in range(count):
             phrase = mnemo.generate(strength=strength)
             acct = Account.from_mnemonic(phrase, account_path=DERIVATION_PATH)
             writer.writerow([i + 1, acct.address, acct.key.hex(), phrase])
-
         tmp.flush()
     finally:
         tmp.close()
-
     return tmp.name
 
-
-# --------------------------------------------------------------------------- #
-# /cancel
-# --------------------------------------------------------------------------- #
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
     await update.message.reply_text(
@@ -264,20 +225,12 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     )
     return ConversationHandler.END
 
-
-# --------------------------------------------------------------------------- #
-# Unknown input fallback
-# --------------------------------------------------------------------------- #
 async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Use /start to generate wallets or /help for more info\\.",
         parse_mode=ParseMode.MARKDOWN_V2,
     )
 
-
-# --------------------------------------------------------------------------- #
-# Main
-# --------------------------------------------------------------------------- #
 def main() -> None:
     app = Application.builder().token(BOT_TOKEN).build()
 
@@ -297,7 +250,6 @@ def main() -> None:
 
     logger.info("Bot started.")
     app.run_polling(drop_pending_updates=True)
-
 
 if __name__ == "__main__":
     main()

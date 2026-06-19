@@ -26,7 +26,7 @@ from telegram.ext import (
     ContextTypes,
 )
 from eth_account import Account
-from pybip39 import Mnemonic   # Rust-based, 5-10x faster than 'mnemonic'
+from mnemonic import Mnemonic   # পুরনো, কিন্তু স্থিতিশীল লাইব্রেরি
 
 # ========================================================================
 #  কনফিগারেশন ও গ্লোবাল সেটিংস
@@ -41,8 +41,8 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 
-# আনুমানিক জেনারেশন স্পিড (ওয়ালেট/সেকেন্ড) – এনভায়রনমেন্ট ভেরিয়েবল দিয়ে কাস্টমাইজ করা যায়
-GENERATION_SPEED = int(os.environ.get("GEN_SPEED", 12000))
+# আনুমানিক জেনারেশন স্পিড (mnemonic লাইব্রেরির জন্য ~800/সেকেন্ড)
+GENERATION_SPEED = int(os.environ.get("GEN_SPEED", 800))
 
 # কনভার্সেশন স্টেট
 ASK_COUNT, ASK_WORDS = range(2)
@@ -52,7 +52,7 @@ VALID_WORD_COUNTS = {12, 15, 18, 21, 24}
 STRENGTH_MAP = {12: 128, 15: 160, 18: 192, 21: 224, 24: 256}
 DERIVATION_PATH = "m/44'/60'/0'/0/0"   # Standard Ethereum path
 
-# Railway Trial-এ ২ vCPU, তাই ২টি ওয়ার্কার
+# Railway Trial-এ ২ vCPU, তাই ২টি ওয়ার্কার (mnemonic ধীর হলেও মাল্টিপ্রসেসিং কাজ করবে)
 MAX_WORKERS = 2
 BATCH_SIZE = 5000   # প্রতি ব্যাচে কয়টি ওয়ালেট (RAM বাঁচাতে)
 
@@ -99,7 +99,7 @@ def generate_batch(start_idx: int, end_idx: int, word_count: int) -> list:
     একটি নির্দিষ্ট রেঞ্জের ওয়ালেট জেনারেট করে।
     প্রতিটি প্রসেস আলাদা Mnemonic instance ব্যবহার করে।
     """
-    mnemo = Mnemonic()
+    mnemo = Mnemonic("english")
     strength = STRENGTH_MAP[word_count]
     results = []
     for i in range(start_idx, end_idx):

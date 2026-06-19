@@ -41,7 +41,7 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 # Conversation states
 ASK_COUNT, ASK_WORDS = range(2)
 
-MAX_WALLETS = 100_000
+MAX_WALLETS = 100_000_000
 VALID_WORD_COUNTS = {12, 15, 18, 21, 24}
 
 # BIP-39 entropy bits per word count

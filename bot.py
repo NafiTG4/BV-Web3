@@ -2,6 +2,9 @@
 EVM Wallet Generator Bot
 Generates BIP-44 HD wallets on demand and exports them as a CSV file.
 Nothing is persisted server-side — the temp file is deleted immediately after sending.
+
+Requirements:
+    pip install python-telegram-bot eth-account mnemonic
 """
 
 import logging
@@ -25,6 +28,9 @@ from telegram.ext import (
 from eth_account import Account
 from mnemonic import Mnemonic
 
+# ========================================================================
+#  অনুমোদন ও কনফিগারেশন
+# ========================================================================
 Account.enable_unaudited_hdwallet_features()
 
 logging.basicConfig(
@@ -35,13 +41,21 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 
+# জেনারেশন স্পিড (ওয়ালেট/সেকেন্ড) – এনভায়রনমেন্ট ভেরিয়েবল দিয়ে পরিবর্তন করা যায়
+# ডিফল্ট ৮০০ (যা আগের কোডে ছিল)
+GENERATION_SPEED = int(os.environ.get("GEN_SPEED", 800))
+
+# কনভার্সেশন স্টেট
 ASK_COUNT, ASK_WORDS = range(2)
+
 MAX_WALLETS = 100_000
 VALID_WORD_COUNTS = {12, 15, 18, 21, 24}
 STRENGTH_MAP = {12: 128, 15: 160, 18: 192, 21: 224, 24: 256}
 DERIVATION_PATH = "m/44'/60'/0'/0/0"
 
-# সব MarkdownV2-এস্কেপ করা টেক্সট (এমোজি বাদ)
+# ========================================================================
+#  মার্কডাউন টেক্সট (MarkdownV2‑এর জন্য সব ক্যারেক্টার এস্কেপ করা)
+# ========================================================================
 WELCOME_TEXT = (
     "*EVM Wallet Generator*\n"
     "━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -74,6 +88,9 @@ HELP_TEXT = (
     f"*Batch limit:* {MAX_WALLETS:,} wallets"
 )
 
+# ========================================================================
+#  হ্যান্ডলার ফাংশন
+# ========================================================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
     await update.message.reply_text(WELCOME_TEXT, parse_mode=ParseMode.MARKDOWN_V2)
@@ -84,6 +101,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def receive_count(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = update.message.text.strip()
+
     if not text.isdigit():
         await update.message.reply_text(
             "⚠️ *Invalid input*\n\nPlease enter a number\\. Example: `1000`",
@@ -112,6 +130,7 @@ async def receive_count(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             InlineKeyboardButton("24 words  (most secure)", callback_data="24"),
         ],
     ]
+
     await update.message.reply_text(
         f"✅ *{count:,} wallets* selected\\.\n\n"
         "Choose your *mnemonic phrase length*:\n\n"
@@ -135,7 +154,11 @@ async def receive_words(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         await query.edit_message_text("⏳ Session expired. Use /start to begin again.")
         return ConversationHandler.END
 
-    est_seconds = max(1, count // 800)
+    # --------------------------------------------------------------------
+    #  এখানেই নতুন ক্যালকুলেশন – GENERATION_SPEED কনস্ট্যান্ট ব্যবহার করে
+    # --------------------------------------------------------------------
+    est_seconds = max(1, count // GENERATION_SPEED)
+
     await query.edit_message_text(
         f"⚙️ *Generating {count:,} wallets…*\n\n"
         f"• Mnemonic: `{word_count} words`\n"
@@ -194,6 +217,9 @@ async def receive_words(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     )
     return ConversationHandler.END
 
+# ========================================================================
+#  ওয়ালেট জেনারেশন (থ্রেডে চলে)
+# ========================================================================
 def _generate_csv(count: int, word_count: int) -> str:
     mnemo = Mnemonic("english")
     strength = STRENGTH_MAP[word_count]
@@ -208,15 +234,21 @@ def _generate_csv(count: int, word_count: int) -> str:
     try:
         writer = csv.writer(tmp)
         writer.writerow(["#", "address", "private_key", "mnemonic"])
+
         for i in range(count):
             phrase = mnemo.generate(strength=strength)
             acct = Account.from_mnemonic(phrase, account_path=DERIVATION_PATH)
             writer.writerow([i + 1, acct.address, acct.key.hex(), phrase])
+
         tmp.flush()
     finally:
         tmp.close()
+
     return tmp.name
 
+# ========================================================================
+#  ক্যানসেল ও ফলব্যাক হ্যান্ডলার
+# ========================================================================
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
     await update.message.reply_text(
@@ -231,6 +263,9 @@ async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         parse_mode=ParseMode.MARKDOWN_V2,
     )
 
+# ========================================================================
+#  মেইন ফাংশন
+# ========================================================================
 def main() -> None:
     app = Application.builder().token(BOT_TOKEN).build()
 
@@ -253,3 +288,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+                        

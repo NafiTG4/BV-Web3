@@ -31,7 +31,7 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
-from telegram.request import BaseRequest, HTTPXRequest
+from telegram.request import HTTPXRequest
 from eth_account import Account
 from mnemonic import Mnemonic
 
@@ -91,21 +91,16 @@ class RateLimiter:
             self.last_refill = time.monotonic()
 
 # ========================================================================
-#  কাস্টম টেলিগ্রাম রিকোয়েস্ট (রেট লিমিট সহ)
+#  কাস্টম টেলিগ্রাম রিকোয়েস্ট (HTTPXRequest থেকে ইনহেরিট)
 # ========================================================================
-class RateLimitedRequest(BaseRequest):
+class RateLimitedRequest(HTTPXRequest):
     def __init__(self, rate: int = 28, per: float = 1.0, **kwargs):
         super().__init__(**kwargs)
-        self._inner = HTTPXRequest(**kwargs)
         self._limiter = RateLimiter(rate, per)
 
     async def post(self, url: str, data: Optional[Dict] = None, files=None, **kwargs):
         await self._limiter.acquire()
-        return await self._inner.post(url, data, files, **kwargs)
-
-    async def do_post(self, url: str, data: Optional[Dict] = None, files=None, **kwargs):
-        await self._limiter.acquire()
-        return await self._inner.do_post(url, data, files, **kwargs)
+        return await super().post(url, data, files, **kwargs)
 
 # ========================================================================
 #  কনফিগ ফাইল হ্যান্ডলিং (config.json)
@@ -113,7 +108,6 @@ class RateLimitedRequest(BaseRequest):
 CONFIG_FILE = "config.json"
 
 def load_config() -> Dict[str, Any]:
-    """config.json থেকে ডেটা লোড করে, না থাকলে ডিফল্ট তৈরি করে"""
     default = {"wallet_generate_limit": 100_000}
     if os.path.exists(CONFIG_FILE):
         try:
@@ -124,7 +118,6 @@ def load_config() -> Dict[str, Any]:
     return default
 
 def save_config(config: Dict[str, Any]) -> None:
-    """config.json-এ ডেটা সেভ করে"""
     with open(CONFIG_FILE, "w") as f:
         json.dump(config, f, indent=2)
 
@@ -210,7 +203,6 @@ def generate_csv_streaming(count: int, word_count: int) -> str:
 #  হ্যান্ডলার – সাধারণ ইউজার ফ্লো
 # ========================================================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """/start – অ্যাডমিন গ্রুপে প্যানেল, অন্যথায় সাধারণ ওয়েলকাম"""
     chat_id = update.effective_chat.id
 
     # অ্যাডমিন গ্রুপে প্যানেল
@@ -241,13 +233,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ASK_COUNT
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/help – শুধু প্রাইভেট চ্যাটে"""
     if update.effective_chat.type != "private":
         return
     await update.message.reply_text(HELP_TEXT, parse_mode=ParseMode.MARKDOWN_V2)
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """/cancel – শুধু প্রাইভেট চ্যাটে"""
     if update.effective_chat.type != "private":
         return ConversationHandler.END
     context.user_data.clear()
@@ -258,7 +248,6 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 async def receive_count(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """ইউজারের কাউন্ট ইনপুট নেয় – শুধু প্রাইভেট চ্যাটে"""
     if update.effective_chat.type != "private":
         return ConversationHandler.END
 
@@ -304,7 +293,6 @@ async def receive_count(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     return ASK_WORDS
 
 async def receive_words(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """ওয়ার্ড কাউন্ট সিলেক্ট – শুধু প্রাইভেট চ্যাটে"""
     query = update.callback_query
     if update.effective_chat.type != "private":
         await query.answer("Not allowed here.")
@@ -385,11 +373,9 @@ async def receive_words(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 #  অ্যাডমিন প্যানেল – ক্যালব্যাক হ্যান্ডলার
 # ========================================================================
 async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """অ্যাডমিন প্যানেলের বাটন হ্যান্ডল করে"""
     query = update.callback_query
     await query.answer()
 
-    # শুধু অ্যাডমিন গ্রুপে কাজ করবে
     if update.effective_chat.id != ADMIN_GROUP_ID:
         await query.edit_message_text("⛔ Unauthorized.")
         return ConversationHandler.END
@@ -397,7 +383,6 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     data = query.data
 
     if data == "admin_user_info":
-        # সহজ পরিসংখ্যান (শুধু ডেমো)
         text = (
             "*User Info*\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -429,7 +414,6 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return ConversationHandler.END
 
     elif data == "admin_set_limit":
-        # কনভার্সেশন শুরু – লিমিট ইনপুট নেওয়া
         await query.edit_message_text(
             "✏️ Enter the new wallet generation limit (number):\n\n"
             "Example: `50000`\n"
@@ -440,7 +424,6 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     return ConversationHandler.END
 
 async def admin_set_limit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """অ্যাডমিনের দেওয়া নতুন লিমিট সেভ করে"""
     if update.effective_chat.id != ADMIN_GROUP_ID:
         return ConversationHandler.END
 
@@ -462,7 +445,6 @@ async def admin_set_limit(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         f"✅ Wallet generation limit updated to *{new_limit:,}*.",
         parse_mode=ParseMode.MARKDOWN_V2,
     )
-    # প্যানেলে ফিরে যেতে /start দিতে বলি
     await update.message.reply_text("Use /start to return to admin panel.")
     return ConversationHandler.END
 
@@ -470,7 +452,6 @@ async def admin_set_limit(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 #  ফলব্যাক – অজানা কমান্ড
 # ========================================================================
 async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """অজানা কমান্ড – শুধু প্রাইভেট চ্যাটে"""
     if update.effective_chat.type != "private":
         return
     await update.message.reply_text(
@@ -482,7 +463,7 @@ async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 #  মেইন ফাংশন
 # ========================================================================
 def main() -> None:
-    # রেট-লিমিটেড রিকোয়েস্ট ক্লাস ব্যবহার করি
+    # রেট-লিমিটেড রিকোয়েস্ট ক্লাস ব্যবহার করি (HTTPXRequest থেকে ইনহেরিট)
     request = RateLimitedRequest(rate=28, per=1.0)
     app = Application.builder().token(BOT_TOKEN).request(request).build()
 
@@ -523,7 +504,7 @@ def main() -> None:
     app.add_handler(admin_conv)
     app.add_handler(CommandHandler("help", help_command))
     # অ্যাডমিন গ্রুপে /start আবার প্যানেল দেখানোর জন্য
-    app.add_handler(CommandHandler("start", start))  # এটি conv_handler-এর এন্ট্রি পয়েন্ট, তবে ওভাররাইড করবে না
+    app.add_handler(CommandHandler("start", start))
 
     # অন্য সব কমান্ড ইগনোর (শুধু প্রাইভেট চ্যাটে)
     app.add_handler(MessageHandler(filters.COMMAND & filters.ChatType.PRIVATE, unknown))

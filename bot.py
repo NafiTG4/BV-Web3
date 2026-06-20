@@ -321,9 +321,9 @@ async def menu_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"*Name:* {name}\n"
         f"*User ID:* `{uid}`\n"
         f"*Username:* {username}\n\n"
-        f"*Wallets Generated:* {escape_md(f\"{user['wallets_generated']:,}\")}\n"
+        f"*Wallets Generated:* {escape_md('{:,}'.format(user['wallets_generated']))}\n"
         f"*Wallet Limit:* {limit}\n"
-        f"*Balance Checked:* {escape_md(f\"{user['balance_checked']:,}\")}\n"
+        f"*Balance Checked:* {escape_md('{:,}'.format(user['balance_checked']))}\n"
     )
     await send_safe(query.edit_message_text(
         text, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=back_kb()

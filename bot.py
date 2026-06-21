@@ -67,10 +67,10 @@ TG_MSG_DELAY          = 0.05
 # ============================================================================
 # GLOBAL RUNTIME CONFIG  (admin-settable at runtime)
 # ============================================================================
-_global_wallet_limit: int  = 100_000
-_rate_csv_per_1000: float  = 0.01    # credits charged per 1000 wallets, CSV export
-_rate_tg_per_1000: float   = 0.03    # credits charged per 1000 wallets, TG export
-_join_balance: float        = 0.0    # credits given to every new user on first /start
+_global_wallet_limit: int  = 100_000_000
+_rate_csv_per_1000: float  = 0.01    # PTS charged per 1000 wallets, CSV export
+_rate_tg_per_1000: float   = 0.03    # PTS charged per 1000 wallets, TG export
+_join_balance: float        = 0.0    # PTS given to every new user on first /start
 
 def get_global_limit() -> int:        return _global_wallet_limit
 def set_global_limit(v: int) -> None:
@@ -392,11 +392,11 @@ async def menu_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"*Name:* {name}\n"
         f"*User ID:* `{uid}`\n"
         f"*Username:* {username}\n\n"
-        f"*Remaining Credits:* `{credits}`\n\n"
+        f"*Remaining PTS:* `{credits}`\n\n"
         f"*Wallets Generated:* `{generated}`\n"
         f"*Balance Checked:* `{checked}`\n\n"
-        f"*Rate Per 1,000 Generate \\(TG\\):* `{rate_tg}` credits\n"
-        f"*Rate Per 1,000 Generate \\(CSV\\):* `{rate_csv}` credits\n"
+        f"*Rate Per 1,000 Generate \\(TG\\):* `{rate_tg}` PTS\n"
+        f"*Rate Per 1,000 Generate \\(CSV\\):* `{rate_csv}` PTS\n"
         f"*Rate Per 1,000 CSV Balance Check:* `coming soon`\n"
     )
     await send_safe(query.edit_message_text(
@@ -513,8 +513,8 @@ async def receive_words(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     await send_safe(query.edit_message_text(
         f"✅ *{escape_md(fmt(count))} wallets* \\| *{word_count} words* selected\\.\n\n"
         "Choose your *export type*\\:\n\n"
-        f"📄 CSV \\- costs `{cost_csv}` credits\n"
-        f"💬 TG Messages \\- costs `{cost_tg}` credits",
+        f"📄 CSV \\- costs `{cost_csv}` PTS\n"
+        f"💬 TG Messages \\- costs `{cost_tg}` PTS",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("📄 CSV File",    callback_data="exp_csv"),
@@ -551,9 +551,9 @@ async def receive_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "━━━━━━━━━━━━━━━━━━━━\n\n"
             f"*Export type:* `{escape_md(export_label)}`\n"
             f"*Wallets:* `{escape_md(fmt(count))}`\n"
-            f"*Cost:* `{escape_md(fmt_credits(required))}` credits\n"
-            f"*Your balance:* `{escape_md(fmt_credits(user['credits']))}` credits\n"
-            f"*Shortfall:* `{escape_md(fmt_credits(shortage))}` credits\n\n"
+            f"*Cost:* `{escape_md(fmt_credits(required))}` PTS\n"
+            f"*Your balance:* `{escape_md(fmt_credits(user['credits']))}` PTS\n"
+            f"*Shortfall:* `{escape_md(fmt_credits(shortage))}` PTS\n\n"
             "Please contact an admin to top up your balance\\.",
             parse_mode=ParseMode.MARKDOWN_V2,
             reply_markup=back_kb(),
@@ -570,7 +570,7 @@ async def receive_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"\\- Derivation: `{escape_md(DERIVATION_PATH)}`\n"
         f"\\- Export as: `{escape_md(export_label)}`\n"
         f"\\- Estimated time: `{escape_md(est)}`\n"
-        f"\\- Cost: `{escape_md(fmt_credits(required))}` credits\n\n"
+        f"\\- Cost: `{escape_md(fmt_credits(required))}` PTS\n\n"
         "_Please wait \\- this happens automatically\\._",
         parse_mode=ParseMode.MARKDOWN_V2,
     ))
@@ -603,7 +603,7 @@ async def receive_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     remaining = escape_md(fmt_credits(user["credits"]))
     await send_safe(query.message.reply_text(
         "🏁 *All done\\!*\n\n"
-        f"💳 *Remaining credits:* `{remaining}`\n\n"
+        f"💳 *Remaining PTS:* `{remaining}`\n\n"
         "Need another batch? Use /start anytime\\.",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=back_kb(),
@@ -690,7 +690,7 @@ async def adm_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     await send_safe(query.edit_message_text(
         "*💰 Balance*\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"*Current join balance:* `{join_bal}` credits\n\n"
+        f"*Current join balance:* `{join_bal}` PTS\n\n"
         "Select an action\\:",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=adm_balance_kb(),
@@ -731,7 +731,7 @@ async def adm_bal_add_uid(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     await send_safe(update.message.reply_text(
         f"User found: *{name}* \\(`{uid}`\\)\n"
-        f"Current balance: `{current}` credits\n\n"
+        f"Current balance: `{current}` PTS\n\n"
         "Send the *amount to add* \\(e\\.g\\. `5` or `0\\.5`\\)\\:",
         parse_mode=ParseMode.MARKDOWN_V2,
     ))
@@ -768,8 +768,8 @@ async def adm_bal_add_amt(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await send_safe(update.message.reply_text(
         f"✅ *Balance updated\\!*\n\n"
         f"User: *{name}* \\(`{uid}`\\)\n"
-        f"Added: `{escape_md(fmt_credits(amount))}` credits\n"
-        f"New balance: `{escape_md(fmt_credits(new_bal))}` credits",
+        f"Added: `{escape_md(fmt_credits(amount))}` PTS\n"
+        f"New balance: `{escape_md(fmt_credits(new_bal))}` PTS",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("➕ Add to Another User", callback_data="adm_bal_add")],
@@ -787,7 +787,7 @@ async def adm_bal_join_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE
     await send_safe(query.edit_message_text(
         "*🎁 New User Join Balance*\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"Current join balance: `{current}` credits\n\n"
+        f"Current join balance: `{current}` PTS\n\n"
         "Every new user gets this amount when they first start the bot\\.\n\n"
         "Send the *new join balance* \\(e\\.g\\. `1` or `0`\\)\\:",
         parse_mode=ParseMode.MARKDOWN_V2,
@@ -813,7 +813,7 @@ async def adm_bal_join_set(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     set_join_balance(val)
     await send_safe(update.message.reply_text(
         f"✅ *Join balance updated\\!*\n\n"
-        f"New users will receive `{escape_md(fmt_credits(val))}` credits on first /start\\.\n"
+        f"New users will receive `{escape_md(fmt_credits(val))}` PTS on first /start\\.\n"
         "_Existing users are not affected\\._",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=InlineKeyboardMarkup([[
@@ -855,8 +855,8 @@ async def adm_rate_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await send_safe(query.edit_message_text(
         "*💸 Wallet Generate Rate*\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"*Per 1,000 CSV Export:* `{csv_rate}` credits\n"
-        f"*Per 1,000 TG Message Export:* `{tg_rate}` credits\n\n"
+        f"*Per 1,000 CSV Export:* `{csv_rate}` PTS\n"
+        f"*Per 1,000 TG Message Export:* `{tg_rate}` PTS\n\n"
         "Select a rate to update\\:",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=adm_rate_wallet_kb(),
@@ -869,7 +869,7 @@ async def adm_rate_csv_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE
     await send_safe(query.edit_message_text(
         "*📄 Per 1,000 CSV Rate*\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"Current rate: `{current}` credits per 1,000 wallets\n\n"
+        f"Current rate: `{current}` PTS per 1,000 wallets\n\n"
         "Send the *new rate* \\(e\\.g\\. `0\\.01`\\)\\:",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=InlineKeyboardMarkup([[
@@ -895,7 +895,7 @@ async def adm_rate_csv_set(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     set_rate_csv(val)
     await send_safe(update.message.reply_text(
         f"✅ *CSV rate updated\\!*\n\n"
-        f"New rate: `{escape_md(fmt_credits(val))}` credits per 1,000 wallets\n"
+        f"New rate: `{escape_md(fmt_credits(val))}` PTS per 1,000 wallets\n"
         "Applied globally immediately\\.",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=InlineKeyboardMarkup([[
@@ -912,7 +912,7 @@ async def adm_rate_tg_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await send_safe(query.edit_message_text(
         "*💬 Per 1,000 TG Message Rate*\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"Current rate: `{current}` credits per 1,000 wallets\n\n"
+        f"Current rate: `{current}` PTS per 1,000 wallets\n\n"
         "Send the *new rate* \\(e\\.g\\. `0\\.03`\\)\\:",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=InlineKeyboardMarkup([[
@@ -938,7 +938,7 @@ async def adm_rate_tg_set(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     set_rate_tg(val)
     await send_safe(update.message.reply_text(
         f"✅ *TG Message rate updated\\!*\n\n"
-        f"New rate: `{escape_md(fmt_credits(val))}` credits per 1,000 wallets\n"
+        f"New rate: `{escape_md(fmt_credits(val))}` PTS per 1,000 wallets\n"
         "Applied globally immediately\\.",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=InlineKeyboardMarkup([[
@@ -994,12 +994,12 @@ async def adm_userinfo_lookup(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"*Name:* {name}\n"
         f"*User ID:* `{uid}`\n"
         f"*Username:* {username}\n\n"
-        f"*Remaining Credits:* `{credits}`\n\n"
+        f"*Remaining PTS:* `{credits}`\n\n"
         f"*Wallets Generated:* `{generated}`\n"
         f"*Wallet Limit:* `{limit}`\n"
         f"*Balance Checked:* `{checked}`\n\n"
-        f"*Rate Per 1,000 Generate \\(TG\\):* `{rate_tg}` credits\n"
-        f"*Rate Per 1,000 Generate \\(CSV\\):* `{rate_csv}` credits\n"
+        f"*Rate Per 1,000 Generate \\(TG\\):* `{rate_tg}` PTS\n"
+        f"*Rate Per 1,000 Generate \\(CSV\\):* `{rate_csv}` PTS\n"
         f"*Rate Per 1,000 CSV Balance Check:* `coming soon`\n"
     )
     await send_safe(update.message.reply_text(
@@ -1021,7 +1021,7 @@ async def adm_wlimit_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         "━━━━━━━━━━━━━━━━━━━━\n\n"
         f"Current global limit: `{current}` wallets\n\n"
         "This applies to *all users* immediately\\.\n\n"
-        "Send the *new limit* \\(1 to 100,000\\)\\:",
+        "Send the *new limit* \\(1 to 100,000,000\\)\\:",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=admin_back_kb(),
     ))
@@ -1040,9 +1040,9 @@ async def adm_wlimit_set(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return ADM_SET_LIMIT_VAL
 
     new_limit = int(text)
-    if new_limit < 1 or new_limit > 100_000:
+    if new_limit < 1 or new_limit > 100_000_000:
         await send_safe(update.message.reply_text(
-            "⚠️ Limit must be between `1` and `100,000`\\.",
+            "⚠️ Limit must be between `1` and `100,000,000`\\.",
             parse_mode=ParseMode.MARKDOWN_V2,
         ))
         return ADM_SET_LIMIT_VAL

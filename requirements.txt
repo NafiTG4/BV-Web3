@@ -1,0 +1,4 @@
+python-telegram-bot==21.6
+eth-account==0.11.3
+mnemonic==0.21
+cryptography==42.0.8

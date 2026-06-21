@@ -4,12 +4,11 @@ BIP-44 HD wallets for all EVM chains (Ethereum, BSC, Polygon, Arbitrum, etc.)
 
 Features:
   - Private chat only (ignores all groups except the admin group)
-  - Admin group: User Info lookup, Balance, Rate tree, Global Wallet Limit
-  - Rate tree: Wallet Generate Rate > Per 1000 CSV Rate / Per 1000 TG Message Rate
-  - Main menu: Profile (full stats), Settings, Bulk Wallet Generator, Balance Checker
-  - Export as CSV or TG Messages (both support up to 100k, rate limited)
+  - Admin: Balance panel (Add User Balance, New User Join Balance), Rate tree, Wallet Limit, User Info
+  - Balance deducted per export type on wallet generate; blocked if insufficient
+  - New users get global join balance on first /start
+  - Export as CSV or TG Messages (both up to 100k, rate limited)
   - Global 28 msg/sec rate limiter with sliding window
-  - Global wallet generation limit (admin can change unlimited times)
   - Startup benchmark for accurate ETA
 
 Requirements:
@@ -52,61 +51,74 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ============================================================================
-# CONFIG  (set BOT_TOKEN and ADMIN_GROUP_ID as Railway env variables)
+# CONFIG
 # ============================================================================
 BOT_TOKEN: str      = os.environ["BOT_TOKEN"]
 ADMIN_GROUP_ID: int = int(os.environ.get("ADMIN_GROUP_ID", "0"))
 
-DERIVATION_PATH     = "m/44'/60'/0'/0/0"
-GLOBAL_MSG_RATE_LIMIT = 28          # Telegram allows 30/sec; we stay at 28 for safety
-BENCHMARK_SAMPLE    = 30
-STRENGTH_MAP        = {12: 128, 15: 160, 18: 192, 21: 224, 24: 256}
-VALID_WORD_COUNTS   = {12, 15, 18, 21, 24}
-TG_WALLETS_PER_MSG  = 10            # wallets bundled per TG message chunk
-TG_MSG_DELAY        = 0.05          # seconds between TG chunks (flood safety)
+DERIVATION_PATH       = "m/44'/60'/0'/0/0"
+GLOBAL_MSG_RATE_LIMIT = 28
+BENCHMARK_SAMPLE      = 30
+STRENGTH_MAP          = {12: 128, 15: 160, 18: 192, 21: 224, 24: 256}
+VALID_WORD_COUNTS     = {12, 15, 18, 21, 24}
+TG_WALLETS_PER_MSG    = 10
+TG_MSG_DELAY          = 0.05
 
 # ============================================================================
-# GLOBAL RUNTIME CONFIG  (admin-settable, applied to all users immediately)
+# GLOBAL RUNTIME CONFIG  (admin-settable at runtime)
 # ============================================================================
-_global_wallet_limit: int   = 100_000
-_rate_csv_per_1000: float   = 0.01   # balance charged per 1000 wallets (CSV)
-_rate_tg_per_1000: float    = 0.03   # balance charged per 1000 wallets (TG messages)
+_global_wallet_limit: int  = 100_000
+_rate_csv_per_1000: float  = 0.01    # credits charged per 1000 wallets, CSV export
+_rate_tg_per_1000: float   = 0.03    # credits charged per 1000 wallets, TG export
+_join_balance: float        = 0.0    # credits given to every new user on first /start
 
-def get_global_limit() -> int:          return _global_wallet_limit
+def get_global_limit() -> int:        return _global_wallet_limit
 def set_global_limit(v: int) -> None:
-    global _global_wallet_limit;        _global_wallet_limit = v
+    global _global_wallet_limit;      _global_wallet_limit = v
 
-def get_rate_csv() -> float:            return _rate_csv_per_1000
+def get_rate_csv() -> float:          return _rate_csv_per_1000
 def set_rate_csv(v: float) -> None:
-    global _rate_csv_per_1000;          _rate_csv_per_1000 = v
+    global _rate_csv_per_1000;        _rate_csv_per_1000 = v
 
-def get_rate_tg() -> float:             return _rate_tg_per_1000
+def get_rate_tg() -> float:           return _rate_tg_per_1000
 def set_rate_tg(v: float) -> None:
-    global _rate_tg_per_1000;           _rate_tg_per_1000 = v
+    global _rate_tg_per_1000;         _rate_tg_per_1000 = v
+
+def get_join_balance() -> float:      return _join_balance
+def set_join_balance(v: float) -> None:
+    global _join_balance;             _join_balance = v
+
+def cost_for(count: int, export_type: str) -> float:
+    """Calculate credit cost for a given wallet count and export type."""
+    rate = get_rate_csv() if export_type == "exp_csv" else get_rate_tg()
+    return (count / 1000) * rate
 
 # ============================================================================
 # CONVERSATION STATES
 # ============================================================================
-ASK_COUNT, ASK_WORDS, ASK_EXPORT         = range(3)
-ADM_USERINFO_QUERY                       = 10
-ADM_SET_LIMIT_VAL                        = 11
-ADM_SET_RATE_CSV_VAL                     = 12
-ADM_SET_RATE_TG_VAL                      = 13
+ASK_COUNT, ASK_WORDS, ASK_EXPORT = range(3)
+ADM_USERINFO_QUERY               = 10
+ADM_SET_LIMIT_VAL                = 11
+ADM_SET_RATE_CSV_VAL             = 12
+ADM_SET_RATE_TG_VAL              = 13
+ADM_ADD_BAL_UID                  = 14
+ADM_ADD_BAL_AMT                  = 15
+ADM_SET_JOIN_BAL                 = 16
 
 # ============================================================================
 # IN-MEMORY USER STORE
-# Replace with SQLite/Postgres when adding real payments.
 # ============================================================================
 USER_DB: dict[int, dict] = {}
 
 def get_user(uid: int, tg_user=None) -> dict:
-    if uid not in USER_DB:
+    is_new = uid not in USER_DB
+    if is_new:
         USER_DB[uid] = {
-            "name":               tg_user.full_name if tg_user else str(uid),
-            "username":           tg_user.username  if tg_user else None,
-            "credits":            0.0,
-            "wallets_generated":  0,
-            "balance_checked":    0,
+            "name":              tg_user.full_name if tg_user else str(uid),
+            "username":          tg_user.username  if tg_user else None,
+            "credits":           get_join_balance(),   # grant join balance on first seen
+            "wallets_generated": 0,
+            "balance_checked":   0,
         }
     elif tg_user:
         USER_DB[uid]["name"]     = tg_user.full_name
@@ -126,13 +138,12 @@ def find_user_by_query(q: str) -> tuple:
     return None, None
 
 # ============================================================================
-# RATE LIMITER  (28 messages/sec, bot-wide sliding window)
+# RATE LIMITER  (28 msg/sec, bot-wide sliding window)
 # ============================================================================
 _msg_timestamps: deque = deque()
 _rate_lock = asyncio.Lock()
 
 async def send_safe(coro):
-    """Wrap any outgoing Telegram coroutine with the global 28 msg/sec limit."""
     while True:
         async with _rate_lock:
             now = time.monotonic()
@@ -170,7 +181,6 @@ def eta_string(count: int) -> str:
 # WALLET GENERATION
 # ============================================================================
 def _generate_wallets(count: int, word_count: int) -> tuple:
-    """CPU-bound. Returns (rows, elapsed_secs). Runs in a thread pool."""
     mnemo    = Mnemonic("english")
     strength = STRENGTH_MAP[word_count]
     rows     = []
@@ -182,7 +192,6 @@ def _generate_wallets(count: int, word_count: int) -> tuple:
     return rows, time.perf_counter() - t0
 
 def _write_csv(rows: list) -> str:
-    """Stream rows to a temp file and return its path."""
     tmp = tempfile.NamedTemporaryFile(
         mode="w", suffix=".csv", delete=False, newline="", encoding="utf-8"
     )
@@ -203,8 +212,10 @@ def escape_md(text) -> str:
     return "".join(f"\\{c}" if c in specials else c for c in str(text))
 
 def fmt(n) -> str:
-    """Format numbers with commas."""
     return "{:,}".format(n)
+
+def fmt_credits(v: float) -> str:
+    return "{:.4f}".format(v)
 
 def is_admin_group(update: Update) -> bool:
     return (
@@ -243,15 +254,20 @@ def admin_menu_kb() -> InlineKeyboardMarkup:
         ],
     ])
 
+def adm_balance_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Add User Balance",      callback_data="adm_bal_add")],
+        [InlineKeyboardButton("🎁 New User Join Balance", callback_data="adm_bal_join")],
+        [InlineKeyboardButton("⬅️ Back",                  callback_data="adm_home")],
+    ])
+
 def adm_rate_kb() -> InlineKeyboardMarkup:
-    """Rate submenu: Wallet Generate Rate + Back."""
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("💸 Wallet Generate Rate", callback_data="adm_rate_wallet")],
         [InlineKeyboardButton("⬅️ Back",                 callback_data="adm_home")],
     ])
 
 def adm_rate_wallet_kb() -> InlineKeyboardMarkup:
-    """Wallet Generate Rate submenu: CSV rate, TG rate, Back."""
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📄 Per 1000 CSV Rate",        callback_data="adm_rate_csv")],
         [InlineKeyboardButton("💬 Per 1000 TG Message Rate", callback_data="adm_rate_tg")],
@@ -266,6 +282,11 @@ def back_kb() -> InlineKeyboardMarkup:
 def admin_back_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("⬅️ Back", callback_data="adm_home")
+    ]])
+
+def adm_balance_back_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("⬅️ Back", callback_data="adm_balance")
     ]])
 
 # ============================================================================
@@ -290,7 +311,7 @@ WELCOME_ADMIN = (
 )
 
 HELP_TEXT = (
-    "*EVM Wallet Generator — Help*\n"
+    "*EVM Wallet Generator \\- Help*\n"
     "━━━━━━━━━━━━━━━━━━━━\n\n"
     "*Commands*\n"
     "/start \\- Open the main menu\n"
@@ -328,6 +349,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not is_private(update):
         return ConversationHandler.END
 
+    # get_user() grants join balance on first call for this uid
     get_user(update.effective_user.id, update.effective_user)
     await send_safe(update.message.reply_text(
         welcome_user_text(),
@@ -358,13 +380,12 @@ async def menu_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     name      = escape_md(user["name"] or "N/A")
     username  = escape_md("@" + user["username"] if user["username"] else "N/A")
-    credits   = escape_md("{:.4f}".format(user["credits"]))
+    credits   = escape_md(fmt_credits(user["credits"]))
     generated = escape_md(fmt(user["wallets_generated"]))
     checked   = escape_md(fmt(user["balance_checked"]))
-    rate_csv  = escape_md("{:.4f}".format(get_rate_csv()))
-    rate_tg   = escape_md("{:.4f}".format(get_rate_tg()))
+    rate_tg   = escape_md(fmt_credits(get_rate_tg()))
+    rate_csv  = escape_md(fmt_credits(get_rate_csv()))
 
-    # Balance check rate is not yet defined; placeholder shown
     text = (
         "*👤 Profile*\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -484,9 +505,16 @@ async def receive_words(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         return ConversationHandler.END
 
     context.user_data["word_count"] = word_count
+
+    # Show cost preview on export selection screen
+    cost_csv = escape_md(fmt_credits(cost_for(count, "exp_csv")))
+    cost_tg  = escape_md(fmt_credits(cost_for(count, "exp_tg")))
+
     await send_safe(query.edit_message_text(
         f"✅ *{escape_md(fmt(count))} wallets* \\| *{word_count} words* selected\\.\n\n"
-        "Choose your *export type*\\:",
+        "Choose your *export type*\\:\n\n"
+        f"📄 CSV \\- costs `{cost_csv}` credits\n"
+        f"💬 TG Messages \\- costs `{cost_tg}` credits",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("📄 CSV File",    callback_data="exp_csv"),
@@ -496,10 +524,10 @@ async def receive_words(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     return ASK_EXPORT
 
 async def receive_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query      = update.callback_query
+    query       = update.callback_query
     await query.answer()
 
-    export_type = query.data   # "exp_csv" or "exp_tg"
+    export_type = query.data
     count       = context.user_data.get("count")
     word_count  = context.user_data.get("word_count")
 
@@ -510,6 +538,29 @@ async def receive_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         ))
         return ConversationHandler.END
 
+    uid  = update.effective_user.id
+    user = get_user(uid)
+
+    # ---- Balance check ----
+    required = cost_for(count, export_type)
+    if user["credits"] < required:
+        shortage     = required - user["credits"]
+        export_label = "CSV" if export_type == "exp_csv" else "TG Messages"
+        await send_safe(query.edit_message_text(
+            f"❌ *Insufficient Credits*\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"*Export type:* `{escape_md(export_label)}`\n"
+            f"*Wallets:* `{escape_md(fmt(count))}`\n"
+            f"*Cost:* `{escape_md(fmt_credits(required))}` credits\n"
+            f"*Your balance:* `{escape_md(fmt_credits(user['credits']))}` credits\n"
+            f"*Shortfall:* `{escape_md(fmt_credits(shortage))}` credits\n\n"
+            "Please contact an admin to top up your balance\\.",
+            parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=back_kb(),
+        ))
+        context.user_data.clear()
+        return ConversationHandler.END
+
     est          = eta_string(count)
     export_label = "CSV file" if export_type == "exp_csv" else "TG messages"
 
@@ -518,7 +569,8 @@ async def receive_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"\\- Mnemonic: `{word_count} words`\n"
         f"\\- Derivation: `{escape_md(DERIVATION_PATH)}`\n"
         f"\\- Export as: `{escape_md(export_label)}`\n"
-        f"\\- Estimated time: `{escape_md(est)}`\n\n"
+        f"\\- Estimated time: `{escape_md(est)}`\n"
+        f"\\- Cost: `{escape_md(fmt_credits(required))}` credits\n\n"
         "_Please wait \\- this happens automatically\\._",
         parse_mode=ParseMode.MARKDOWN_V2,
     ))
@@ -535,6 +587,10 @@ async def receive_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         context.user_data.clear()
         return ConversationHandler.END
 
+    # Deduct balance AFTER successful generation, before delivery
+    user["credits"]           -= required
+    user["wallets_generated"] += count
+
     elapsed = f"{actual_secs:.1f}s" if actual_secs < 60 else f"{actual_secs / 60:.1f} min"
 
     if export_type == "exp_csv":
@@ -542,13 +598,13 @@ async def receive_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     else:
         await _deliver_tg(query, context, rows, count, elapsed)
 
-    # Update user stats
-    user = get_user(update.effective_user.id)
-    user["wallets_generated"] += count
     context.user_data.clear()
 
+    remaining = escape_md(fmt_credits(user["credits"]))
     await send_safe(query.message.reply_text(
-        "🏁 *All done\\!*\n\nNeed another batch? Use /start anytime\\.",
+        "🏁 *All done\\!*\n\n"
+        f"💳 *Remaining credits:* `{remaining}`\n\n"
+        "Need another batch? Use /start anytime\\.",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=back_kb(),
     ))
@@ -625,7 +681,150 @@ async def _deliver_tg(query, context, rows: list, count: int, elapsed: str) -> N
     ))
 
 # ============================================================================
-# ADMIN STATIC CALLBACKS
+# ADMIN: BALANCE PANEL
+# ============================================================================
+async def adm_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    join_bal = escape_md(fmt_credits(get_join_balance()))
+    await send_safe(query.edit_message_text(
+        "*💰 Balance*\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"*Current join balance:* `{join_bal}` credits\n\n"
+        "Select an action\\:",
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=adm_balance_kb(),
+    ))
+    return ConversationHandler.END
+
+# -- Add User Balance --------------------------------------------------------
+async def adm_bal_add_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    await send_safe(query.edit_message_text(
+        "*➕ Add User Balance*\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "Send the *Telegram ID* or *@username* of the user you want to top up\\.",
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=adm_balance_back_kb(),
+    ))
+    return ADM_ADD_BAL_UID
+
+async def adm_bal_add_uid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not is_admin_group(update):
+        return ADM_ADD_BAL_UID
+
+    q        = update.message.text.strip()
+    uid, user = find_user_by_query(q)
+
+    if user is None:
+        await send_safe(update.message.reply_text(
+            f"⚠️ No user found for `{escape_md(q)}`\\.\n\n"
+            "Make sure the user has started the bot first\\.",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        ))
+        return ADM_ADD_BAL_UID
+
+    context.user_data["bal_target_uid"] = uid
+    name    = escape_md(user["name"])
+    current = escape_md(fmt_credits(user["credits"]))
+
+    await send_safe(update.message.reply_text(
+        f"User found: *{name}* \\(`{uid}`\\)\n"
+        f"Current balance: `{current}` credits\n\n"
+        "Send the *amount to add* \\(e\\.g\\. `5` or `0\\.5`\\)\\:",
+        parse_mode=ParseMode.MARKDOWN_V2,
+    ))
+    return ADM_ADD_BAL_AMT
+
+async def adm_bal_add_amt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not is_admin_group(update):
+        return ADM_ADD_BAL_AMT
+
+    try:
+        amount = float(update.message.text.strip())
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        await send_safe(update.message.reply_text(
+            "⚠️ Please send a valid positive number \\(e\\.g\\. `5` or `0\\.5`\\)\\.",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        ))
+        return ADM_ADD_BAL_AMT
+
+    uid = context.user_data.get("bal_target_uid")
+    if uid is None or uid not in USER_DB:
+        await send_safe(update.message.reply_text(
+            "Session expired\\. Please use Add User Balance again\\.",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        ))
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    USER_DB[uid]["credits"] += amount
+    new_bal = USER_DB[uid]["credits"]
+    name    = escape_md(USER_DB[uid]["name"])
+
+    await send_safe(update.message.reply_text(
+        f"✅ *Balance updated\\!*\n\n"
+        f"User: *{name}* \\(`{uid}`\\)\n"
+        f"Added: `{escape_md(fmt_credits(amount))}` credits\n"
+        f"New balance: `{escape_md(fmt_credits(new_bal))}` credits",
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ Add to Another User", callback_data="adm_bal_add")],
+            [InlineKeyboardButton("⬅️ Back",               callback_data="adm_balance")],
+        ]),
+    ))
+    context.user_data.clear()
+    return ConversationHandler.END
+
+# -- New User Join Balance ---------------------------------------------------
+async def adm_bal_join_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    current = escape_md(fmt_credits(get_join_balance()))
+    await send_safe(query.edit_message_text(
+        "*🎁 New User Join Balance*\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"Current join balance: `{current}` credits\n\n"
+        "Every new user gets this amount when they first start the bot\\.\n\n"
+        "Send the *new join balance* \\(e\\.g\\. `1` or `0`\\)\\:",
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=adm_balance_back_kb(),
+    ))
+    return ADM_SET_JOIN_BAL
+
+async def adm_bal_join_set(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not is_admin_group(update):
+        return ADM_SET_JOIN_BAL
+
+    try:
+        val = float(update.message.text.strip())
+        if val < 0:
+            raise ValueError
+    except ValueError:
+        await send_safe(update.message.reply_text(
+            "⚠️ Please send a valid non-negative number \\(e\\.g\\. `1` or `0`\\)\\.",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        ))
+        return ADM_SET_JOIN_BAL
+
+    set_join_balance(val)
+    await send_safe(update.message.reply_text(
+        f"✅ *Join balance updated\\!*\n\n"
+        f"New users will receive `{escape_md(fmt_credits(val))}` credits on first /start\\.\n"
+        "_Existing users are not affected\\._",
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("⬅️ Back to Balance", callback_data="adm_balance")
+        ]]),
+    ))
+    context.user_data.clear()
+    return ConversationHandler.END
+
+# ============================================================================
+# ADMIN: RATE TREE
 # ============================================================================
 async def admin_home(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
@@ -637,21 +836,6 @@ async def admin_home(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     ))
     return ConversationHandler.END
 
-async def adm_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    await send_safe(query.edit_message_text(
-        "*💰 Balance*\n\n🚧 Coming soon\\.",
-        parse_mode=ParseMode.MARKDOWN_V2,
-        reply_markup=admin_back_kb(),
-    ))
-
-# ============================================================================
-# ADMIN RATE TREE
-# adm_rate -> adm_rate_kb (Wallet Generate Rate | Back)
-# adm_rate_wallet -> adm_rate_wallet_kb (Per 1000 CSV | Per 1000 TG | Back)
-# adm_rate_csv / adm_rate_tg -> conversation to set value
-# ============================================================================
 async def adm_rate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
@@ -666,8 +850,8 @@ async def adm_rate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def adm_rate_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
-    csv_rate = escape_md("{:.4f}".format(get_rate_csv()))
-    tg_rate  = escape_md("{:.4f}".format(get_rate_tg()))
+    csv_rate = escape_md(fmt_credits(get_rate_csv()))
+    tg_rate  = escape_md(fmt_credits(get_rate_tg()))
     await send_safe(query.edit_message_text(
         "*💸 Wallet Generate Rate*\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -678,16 +862,15 @@ async def adm_rate_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         reply_markup=adm_rate_wallet_kb(),
     ))
 
-# -- Set CSV Rate ------------------------------------------------------------
 async def adm_rate_csv_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
-    current = escape_md("{:.4f}".format(get_rate_csv()))
+    current = escape_md(fmt_credits(get_rate_csv()))
     await send_safe(query.edit_message_text(
         "*📄 Per 1,000 CSV Rate*\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
         f"Current rate: `{current}` credits per 1,000 wallets\n\n"
-        "Send the *new rate* as a number \\(e\\.g\\. `0\\.01`\\)\\:",
+        "Send the *new rate* \\(e\\.g\\. `0\\.01`\\)\\:",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("⬅️ Back", callback_data="adm_rate_wallet")
@@ -712,7 +895,7 @@ async def adm_rate_csv_set(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     set_rate_csv(val)
     await send_safe(update.message.reply_text(
         f"✅ *CSV rate updated\\!*\n\n"
-        f"New rate: `{escape_md('{:.4f}'.format(val))}` credits per 1,000 wallets\n"
+        f"New rate: `{escape_md(fmt_credits(val))}` credits per 1,000 wallets\n"
         "Applied globally immediately\\.",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=InlineKeyboardMarkup([[
@@ -722,16 +905,15 @@ async def adm_rate_csv_set(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     context.user_data.clear()
     return ConversationHandler.END
 
-# -- Set TG Rate -------------------------------------------------------------
 async def adm_rate_tg_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
-    current = escape_md("{:.4f}".format(get_rate_tg()))
+    current = escape_md(fmt_credits(get_rate_tg()))
     await send_safe(query.edit_message_text(
         "*💬 Per 1,000 TG Message Rate*\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
         f"Current rate: `{current}` credits per 1,000 wallets\n\n"
-        "Send the *new rate* as a number \\(e\\.g\\. `0\\.03`\\)\\:",
+        "Send the *new rate* \\(e\\.g\\. `0\\.03`\\)\\:",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("⬅️ Back", callback_data="adm_rate_wallet")
@@ -756,7 +938,7 @@ async def adm_rate_tg_set(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     set_rate_tg(val)
     await send_safe(update.message.reply_text(
         f"✅ *TG Message rate updated\\!*\n\n"
-        f"New rate: `{escape_md('{:.4f}'.format(val))}` credits per 1,000 wallets\n"
+        f"New rate: `{escape_md(fmt_credits(val))}` credits per 1,000 wallets\n"
         "Applied globally immediately\\.",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=InlineKeyboardMarkup([[
@@ -767,7 +949,7 @@ async def adm_rate_tg_set(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     return ConversationHandler.END
 
 # ============================================================================
-# ADMIN USER INFO (lookup by Telegram ID or @username)
+# ADMIN: USER INFO
 # ============================================================================
 async def adm_userinfo_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
@@ -786,7 +968,7 @@ async def adm_userinfo_lookup(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not is_admin_group(update):
         return ADM_USERINFO_QUERY
 
-    q        = update.message.text.strip()
+    q         = update.message.text.strip()
     uid, user = find_user_by_query(q)
 
     if user is None:
@@ -799,11 +981,11 @@ async def adm_userinfo_lookup(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     name      = escape_md(user["name"] or "N/A")
     username  = escape_md("@" + user["username"] if user["username"] else "N/A")
-    credits   = escape_md("{:.4f}".format(user["credits"]))
+    credits   = escape_md(fmt_credits(user["credits"]))
     generated = escape_md(fmt(user["wallets_generated"]))
     checked   = escape_md(fmt(user["balance_checked"]))
-    rate_csv  = escape_md("{:.4f}".format(get_rate_csv()))
-    rate_tg   = escape_md("{:.4f}".format(get_rate_tg()))
+    rate_tg   = escape_md(fmt_credits(get_rate_tg()))
+    rate_csv  = escape_md(fmt_credits(get_rate_csv()))
     limit     = escape_md(fmt(get_global_limit()))
 
     text = (
@@ -825,10 +1007,10 @@ async def adm_userinfo_lookup(update: Update, context: ContextTypes.DEFAULT_TYPE
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=admin_back_kb(),
     ))
-    return ADM_USERINFO_QUERY   # stay active for next lookup
+    return ADM_USERINFO_QUERY
 
 # ============================================================================
-# ADMIN GLOBAL WALLET LIMIT  (unlimited number of times settable)
+# ADMIN: WALLET LIMIT
 # ============================================================================
 async def adm_wlimit_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
@@ -921,13 +1103,12 @@ def main() -> None:
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # User bulk wallet generator conversation (private chat)
+    # User: Bulk Wallet Generator
     user_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(bulk_entry, pattern="^menu_bulk$")],
         states={
-            ASK_COUNT: [MessageHandler(
-                filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
-                receive_count,
+            ASK_COUNT:  [MessageHandler(
+                filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, receive_count
             )],
             ASK_WORDS:  [CallbackQueryHandler(receive_words,  pattern=r"^wc_(12|15|18|21|24)$")],
             ASK_EXPORT: [CallbackQueryHandler(receive_export, pattern="^exp_(csv|tg)$")],
@@ -939,7 +1120,7 @@ def main() -> None:
         allow_reentry=True,
     )
 
-    # Admin: User Info lookup conversation
+    # Admin: User Info lookup
     admin_userinfo_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(adm_userinfo_prompt, pattern="^adm_userinfo$")],
         states={
@@ -952,7 +1133,7 @@ def main() -> None:
         allow_reentry=True,
     )
 
-    # Admin: Global Wallet Limit conversation
+    # Admin: Global Wallet Limit
     admin_wlimit_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(adm_wlimit_prompt, pattern="^adm_wlimit$")],
         states={
@@ -965,7 +1146,7 @@ def main() -> None:
         allow_reentry=True,
     )
 
-    # Admin: CSV Rate conversation
+    # Admin: CSV Rate
     admin_rate_csv_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(adm_rate_csv_prompt, pattern="^adm_rate_csv$")],
         states={
@@ -980,7 +1161,7 @@ def main() -> None:
         allow_reentry=True,
     )
 
-    # Admin: TG Rate conversation
+    # Admin: TG Rate
     admin_rate_tg_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(adm_rate_tg_prompt, pattern="^adm_rate_tg$")],
         states={
@@ -995,17 +1176,48 @@ def main() -> None:
         allow_reentry=True,
     )
 
+    # Admin: Add User Balance
+    admin_add_bal_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(adm_bal_add_prompt, pattern="^adm_bal_add$")],
+        states={
+            ADM_ADD_BAL_UID: [MessageHandler(filters.TEXT & ~filters.COMMAND, adm_bal_add_uid)],
+            ADM_ADD_BAL_AMT: [MessageHandler(filters.TEXT & ~filters.COMMAND, adm_bal_add_amt)],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            CallbackQueryHandler(adm_balance, pattern="^adm_balance$"),
+            CallbackQueryHandler(admin_home,  pattern="^adm_home$"),
+        ],
+        allow_reentry=True,
+    )
+
+    # Admin: New User Join Balance
+    admin_join_bal_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(adm_bal_join_prompt, pattern="^adm_bal_join$")],
+        states={
+            ADM_SET_JOIN_BAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, adm_bal_join_set)],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            CallbackQueryHandler(adm_balance, pattern="^adm_balance$"),
+            CallbackQueryHandler(admin_home,  pattern="^adm_home$"),
+        ],
+        allow_reentry=True,
+    )
+
     # Commands
     app.add_handler(CommandHandler("start",  start))
     app.add_handler(CommandHandler("help",   help_command))
     app.add_handler(CommandHandler("cancel", cancel))
 
-    # Conversations (order matters; more specific first)
+    # Conversations
     app.add_handler(user_conv)
     app.add_handler(admin_userinfo_conv)
     app.add_handler(admin_wlimit_conv)
     app.add_handler(admin_rate_csv_conv)
     app.add_handler(admin_rate_tg_conv)
+    app.add_handler(admin_add_bal_conv)
+    app.add_handler(admin_join_bal_conv)
 
     # Static callbacks (private)
     app.add_handler(CallbackQueryHandler(menu_home,     pattern="^menu_home$"))

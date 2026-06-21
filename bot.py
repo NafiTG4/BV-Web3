@@ -392,7 +392,7 @@ async def menu_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"*Name:* {name}\n"
         f"*User ID:* `{uid}`\n"
         f"*Username:* {username}\n\n"
-        f"*Remaining PTS:* `{credits}`\n\n"
+        f"*Remaining Credit:* `{credits}` PTS\n\n"
         f"*Wallets Generated:* `{generated}`\n"
         f"*Balance Checked:* `{checked}`\n\n"
         f"*Rate Per 1,000 Generate \\(TG\\):* `{rate_tg}` PTS\n"
@@ -603,7 +603,7 @@ async def receive_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     remaining = escape_md(fmt_credits(user["credits"]))
     await send_safe(query.message.reply_text(
         "🏁 *All done\\!*\n\n"
-        f"💳 *Remaining PTS:* `{remaining}`\n\n"
+        f"💳 *Remaining Credit:* `{remaining}` PTS\n\n"
         "Need another batch? Use /start anytime\\.",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=back_kb(),
@@ -994,7 +994,7 @@ async def adm_userinfo_lookup(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"*Name:* {name}\n"
         f"*User ID:* `{uid}`\n"
         f"*Username:* {username}\n\n"
-        f"*Remaining PTS:* `{credits}`\n\n"
+        f"*Remaining Credit:* `{credits}` PTS\n\n"
         f"*Wallets Generated:* `{generated}`\n"
         f"*Wallet Limit:* `{limit}`\n"
         f"*Balance Checked:* `{checked}`\n\n"

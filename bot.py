@@ -1,14 +1,14 @@
 """
-EVM Wallet Generator Bot
-BIP-44 HD wallets for all EVM chains (Ethereum, BSC, Polygon, Arbitrum, etc.)
+EVM Wallet Generator Bot - bot.py
+BIP-44 HD wallets for all EVM chains.
 
 Features:
-  - Private chat only (ignores all groups except the admin group)
-  - Admin: Balance panel (Add User Balance, New User Join Balance), Rate tree, Wallet Limit, User Info
-  - Balance deducted per export type on wallet generate; blocked if insufficient
-  - New users get global join balance on first /start
-  - Export as CSV or TG Messages (both up to 100k, rate limited)
-  - Global 28 msg/sec rate limiter with sliding window
+  - Access code gate on /start (private chat)
+  - Admin group: User Info, Balance, Rate tree, Wallet Limit, Access Management
+  - Access Management: Random (N slots) and Custom (specific UIDs), Hourly/Days validation
+  - Export as CSV or TG Messages (up to 100M wallets)
+  - Global 28 msg/sec rate limiter
+  - Balance (PTS) system with deduction per export type
   - Startup benchmark for accurate ETA
 
 Requirements:
@@ -20,6 +20,7 @@ import csv
 import logging
 import math
 import os
+import secrets
 import tempfile
 import time
 from collections import deque
@@ -39,9 +40,6 @@ from telegram.ext import (
     filters,
 )
 
-# ============================================================================
-# STARTUP
-# ============================================================================
 Account.enable_unaudited_hdwallet_features()
 
 logging.basicConfig(
@@ -65,58 +63,65 @@ TG_WALLETS_PER_MSG    = 10
 TG_MSG_DELAY          = 0.05
 
 # ============================================================================
-# GLOBAL RUNTIME CONFIG  (admin-settable at runtime)
+# GLOBAL RUNTIME CONFIG
 # ============================================================================
-_global_wallet_limit: int  = 100_000_000
-_rate_csv_per_1000: float  = 0.01    # PTS charged per 1000 wallets, CSV export
-_rate_tg_per_1000: float   = 0.03    # PTS charged per 1000 wallets, TG export
-_join_balance: float        = 0.0    # PTS given to every new user on first /start
+_global_wallet_limit: int = 100_000_000
+_rate_csv_per_1000: float = 0.01
+_rate_tg_per_1000: float  = 0.03
+_join_balance: float      = 0.0
 
-def get_global_limit() -> int:        return _global_wallet_limit
-def set_global_limit(v: int) -> None:
-    global _global_wallet_limit;      _global_wallet_limit = v
+def get_global_limit() -> int:       return _global_wallet_limit
+def set_global_limit(v: int):
+    global _global_wallet_limit;     _global_wallet_limit = v
 
-def get_rate_csv() -> float:          return _rate_csv_per_1000
-def set_rate_csv(v: float) -> None:
-    global _rate_csv_per_1000;        _rate_csv_per_1000 = v
+def get_rate_csv() -> float:         return _rate_csv_per_1000
+def set_rate_csv(v: float):
+    global _rate_csv_per_1000;       _rate_csv_per_1000 = v
 
-def get_rate_tg() -> float:           return _rate_tg_per_1000
-def set_rate_tg(v: float) -> None:
-    global _rate_tg_per_1000;         _rate_tg_per_1000 = v
+def get_rate_tg() -> float:          return _rate_tg_per_1000
+def set_rate_tg(v: float):
+    global _rate_tg_per_1000;        _rate_tg_per_1000 = v
 
-def get_join_balance() -> float:      return _join_balance
-def set_join_balance(v: float) -> None:
-    global _join_balance;             _join_balance = v
+def get_join_balance() -> float:     return _join_balance
+def set_join_balance(v: float):
+    global _join_balance;            _join_balance = v
 
 def cost_for(count: int, export_type: str) -> float:
-    """Calculate credit cost for a given wallet count and export type."""
     rate = get_rate_csv() if export_type == "exp_csv" else get_rate_tg()
     return (count / 1000) * rate
 
 # ============================================================================
 # CONVERSATION STATES
 # ============================================================================
-ASK_COUNT, ASK_WORDS, ASK_EXPORT = range(3)
-ADM_USERINFO_QUERY               = 10
-ADM_SET_LIMIT_VAL                = 11
-ADM_SET_RATE_CSV_VAL             = 12
-ADM_SET_RATE_TG_VAL              = 13
-ADM_ADD_BAL_UID                  = 14
-ADM_ADD_BAL_AMT                  = 15
-ADM_SET_JOIN_BAL                 = 16
+USER_ENTER_CODE         = 1
+ASK_COUNT               = 2
+ASK_WORDS               = 3
+ASK_EXPORT              = 4
+
+ADM_USERINFO_QUERY      = 10
+ADM_SET_LIMIT_VAL       = 11
+ADM_SET_RATE_CSV_VAL    = 12
+ADM_SET_RATE_TG_VAL     = 13
+ADM_ADD_BAL_UID         = 14
+ADM_ADD_BAL_AMT         = 15
+ADM_SET_JOIN_BAL        = 16
+
+ADM_AC_RANDOM_COUNT     = 20
+ADM_AC_VAL_TYPE         = 21
+ADM_AC_VAL_AMT          = 22
+ADM_AC_CUSTOM_UID       = 23
 
 # ============================================================================
-# IN-MEMORY USER STORE
+# USER STORE
 # ============================================================================
 USER_DB: dict[int, dict] = {}
 
 def get_user(uid: int, tg_user=None) -> dict:
-    is_new = uid not in USER_DB
-    if is_new:
+    if uid not in USER_DB:
         USER_DB[uid] = {
             "name":              tg_user.full_name if tg_user else str(uid),
             "username":          tg_user.username  if tg_user else None,
-            "credits":           get_join_balance(),   # grant join balance on first seen
+            "credits":           get_join_balance(),
             "wallets_generated": 0,
             "balance_checked":   0,
         }
@@ -125,20 +130,60 @@ def get_user(uid: int, tg_user=None) -> dict:
         USER_DB[uid]["username"] = tg_user.username
     return USER_DB[uid]
 
-def find_user_by_query(q: str) -> tuple:
-    """Find user by numeric Telegram ID or @username. Returns (uid, user) or (None, None)."""
+def find_user(q: str) -> tuple:
     q = q.strip().lstrip("@")
     if q.isdigit():
         uid = int(q)
         return (uid, USER_DB[uid]) if uid in USER_DB else (None, None)
-    q_lower = q.lower()
+    ql = q.lower()
     for uid, u in USER_DB.items():
-        if u["username"] and u["username"].lower() == q_lower:
+        if u["username"] and u["username"].lower() == ql:
             return uid, u
     return None, None
 
 # ============================================================================
-# RATE LIMITER  (28 msg/sec, bot-wide sliding window)
+# ACCESS CODE STORE
+# code -> {type, slots, allowed_uids, used_uids, expires_at}
+# ============================================================================
+ACCESS_CODES: dict[str, dict]  = {}
+GRANTED_USERS: dict[int, float] = {}   # uid -> expiry unix timestamp
+
+def _make_code() -> str:
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    return "".join(secrets.choice(alphabet) for _ in range(8))
+
+def is_access_granted(uid: int) -> bool:
+    expiry = GRANTED_USERS.get(uid)
+    if expiry is None:
+        return False
+    if time.time() > expiry:
+        del GRANTED_USERS[uid]
+        return False
+    return True
+
+def redeem_code(code: str, uid: int) -> tuple[bool, str]:
+    code  = code.strip().upper()
+    entry = ACCESS_CODES.get(code)
+    if entry is None:
+        return False, "Invalid access code."
+    if time.time() > entry["expires_at"]:
+        del ACCESS_CODES[code]
+        return False, "This access code has expired."
+    if entry["type"] == "random":
+        if uid not in entry["used_uids"] and entry["slots"] <= 0:
+            return False, "This access code has no remaining slots."
+        if uid not in entry["used_uids"]:
+            entry["slots"] -= 1
+            entry["used_uids"].add(uid)
+    elif entry["type"] == "custom":
+        if uid not in entry["allowed_uids"]:
+            return False, "This access code is not valid for your account."
+        entry["used_uids"].add(uid)
+    GRANTED_USERS[uid] = entry["expires_at"]
+    return True, "Access granted."
+
+# ============================================================================
+# RATE LIMITER
 # ============================================================================
 _msg_timestamps: deque = deque()
 _rate_lock = asyncio.Lock()
@@ -214,7 +259,7 @@ def escape_md(text) -> str:
 def fmt(n) -> str:
     return "{:,}".format(n)
 
-def fmt_credits(v: float) -> str:
+def fmt_pts(v: float) -> str:
     return "{:.4f}".format(v)
 
 def is_admin_group(update: Update) -> bool:
@@ -251,6 +296,9 @@ def admin_menu_kb() -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton("📊 Rate",                  callback_data="adm_rate"),
             InlineKeyboardButton("🔢 Wallet Generate Limit", callback_data="adm_wlimit"),
+        ],
+        [
+            InlineKeyboardButton("🔐 Access Management",     callback_data="adm_access"),
         ],
     ])
 
@@ -293,26 +341,27 @@ def adm_balance_back_kb() -> InlineKeyboardMarkup:
 # DYNAMIC TEXTS
 # ============================================================================
 def welcome_user_text() -> str:
+    limit = escape_md(fmt(get_global_limit()))
     return (
         "*EVM Wallet Generator*\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
         "Generates BIP\\-44 HD wallets compatible with all EVM chains "
         "\\(Ethereum, BSC, Polygon, Arbitrum, etc\\.\\)\n\n"
-        "🔒 *Privacy:* Nothing is stored on the server\\.\n"
-        f"📦 *Limit:* Up to {escape_md(fmt(get_global_limit()))} wallets per batch\n\n"
+        "\U0001f512 *Privacy:* Nothing is stored on the server\\.\n"
+        f"\U0001f4e6 *Limit:* Up to {limit} wallets per batch\n\n"
         "Choose an option below\\:"
     )
 
 WELCOME_ADMIN = (
     "*EVM Wallet Generator*\n"
-    "━━━━━━━━━━━━━━━━━━━━\n\n"
-    "🛡️ *Admin Panel*\n\n"
+    "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
+    "\U0001f6e1\ufe0f *Admin Panel*\n\n"
     "Use the buttons below to manage users and bot settings\\."
 )
 
 HELP_TEXT = (
     "*EVM Wallet Generator \\- Help*\n"
-    "━━━━━━━━━━━━━━━━━━━━\n\n"
+    "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
     "*Commands*\n"
     "/start \\- Open the main menu\n"
     "/help \\- Show this help message\n"
@@ -333,7 +382,7 @@ HELP_TEXT = (
 )
 
 # ============================================================================
-# /start
+# /start  (private: requires access code if not granted)
 # ============================================================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
@@ -349,8 +398,58 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not is_private(update):
         return ConversationHandler.END
 
-    # get_user() grants join balance on first call for this uid
-    get_user(update.effective_user.id, update.effective_user)
+    uid = update.effective_user.id
+
+    if is_access_granted(uid):
+        get_user(uid, update.effective_user)
+        await send_safe(update.message.reply_text(
+            welcome_user_text(),
+            parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=main_menu_kb(),
+        ))
+        return ConversationHandler.END
+
+    # Ask for access code, show user their own ID
+    await send_safe(update.message.reply_text(
+        "*EVM Wallet Generator*\n"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
+        "\U0001f510 *Access Required*\n\n"
+        f"Your Telegram ID: `{uid}`\n\n"
+        "Please enter your *8\\-character access code* to continue\\.",
+        parse_mode=ParseMode.MARKDOWN_V2,
+    ))
+    return USER_ENTER_CODE
+
+# ============================================================================
+# USER: ACCESS CODE ENTRY
+# ============================================================================
+async def user_enter_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not is_private(update):
+        return USER_ENTER_CODE
+
+    code    = update.message.text.strip()
+    uid     = update.effective_user.id
+    success, msg = redeem_code(code, uid)
+
+    if not success:
+        await send_safe(update.message.reply_text(
+            f"\u274c *Access Denied*\n\n"
+            f"{escape_md(msg)}\n\n"
+            f"Your Telegram ID: `{uid}`\n\n"
+            "Please check your code and try again\\.",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        ))
+        return USER_ENTER_CODE
+
+    get_user(uid, update.effective_user)
+    expiry_dt = datetime.utcfromtimestamp(GRANTED_USERS[uid]).strftime("%Y-%m-%d %H:%M UTC")
+    await send_safe(update.message.reply_text(
+        f"\u2705 *Access Granted\\!*\n\n"
+        f"Your access is valid until:\n"
+        f"`{escape_md(expiry_dt)}`\n\n"
+        "Redirecting to main menu\\.",
+        parse_mode=ParseMode.MARKDOWN_V2,
+    ))
     await send_safe(update.message.reply_text(
         welcome_user_text(),
         parse_mode=ParseMode.MARKDOWN_V2,
@@ -359,7 +458,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 # ============================================================================
-# MAIN MENU CALLBACKS (private chat)
+# MAIN MENU CALLBACKS
 # ============================================================================
 async def menu_home(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
@@ -380,19 +479,26 @@ async def menu_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     name      = escape_md(user["name"] or "N/A")
     username  = escape_md("@" + user["username"] if user["username"] else "N/A")
-    credits   = escape_md(fmt_credits(user["credits"]))
+    pts       = escape_md(fmt_pts(user["credits"]))
     generated = escape_md(fmt(user["wallets_generated"]))
     checked   = escape_md(fmt(user["balance_checked"]))
-    rate_tg   = escape_md(fmt_credits(get_rate_tg()))
-    rate_csv  = escape_md(fmt_credits(get_rate_csv()))
+    rate_tg   = escape_md(fmt_pts(get_rate_tg()))
+    rate_csv  = escape_md(fmt_pts(get_rate_csv()))
+
+    # Show access expiry if granted
+    expiry_line = ""
+    if uid in GRANTED_USERS:
+        exp = datetime.utcfromtimestamp(GRANTED_USERS[uid]).strftime("%Y-%m-%d %H:%M UTC")
+        expiry_line = f"*Access Expires:* `{escape_md(exp)}`\n"
 
     text = (
-        "*👤 Profile*\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "*\U0001f464 Profile*\n"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
         f"*Name:* {name}\n"
         f"*User ID:* `{uid}`\n"
-        f"*Username:* {username}\n\n"
-        f"*Remaining Credit:* `{credits}` PTS\n\n"
+        f"*Username:* {username}\n"
+        f"{expiry_line}\n"
+        f"*Remaining Credit:* `{pts}` PTS\n\n"
         f"*Wallets Generated:* `{generated}`\n"
         f"*Balance Checked:* `{checked}`\n\n"
         f"*Rate Per 1,000 Generate \\(TG\\):* `{rate_tg}` PTS\n"
@@ -407,7 +513,7 @@ async def menu_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     query = update.callback_query
     await query.answer()
     await send_safe(query.edit_message_text(
-        "*⚙️ Settings*\n\n🚧 Coming soon\\.",
+        "*\u2699\ufe0f Settings*\n\n\U0001f6a7 Coming soon\\.",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=back_kb(),
     ))
@@ -416,7 +522,7 @@ async def menu_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     query = update.callback_query
     await query.answer()
     await send_safe(query.edit_message_text(
-        "*💰 Balance Checker*\n\n🚧 Coming soon\\.",
+        "*\U0001f4b0 Balance Checker*\n\n\U0001f6a7 Coming soon\\.",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=back_kb(),
     ))
@@ -430,8 +536,8 @@ async def bulk_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
     limit = get_global_limit()
     await send_safe(query.edit_message_text(
-        "*🪪 Bulk Wallet Generator*\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "*\U0001fa96 Bulk Wallet Generator*\n"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
         "How many wallets do you need?\n"
         f"_Enter a number between `1` and `{escape_md(fmt(limit))}`_",
         parse_mode=ParseMode.MARKDOWN_V2,
@@ -447,7 +553,7 @@ async def receive_count(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
     if not text.isdigit():
         await send_safe(update.message.reply_text(
-            "⚠️ *Invalid input*\n\nPlease enter a number\\. Example: `1000`",
+            "\u26a0\ufe0f *Invalid input*\n\nPlease enter a number\\. Example: `1000`",
             parse_mode=ParseMode.MARKDOWN_V2,
         ))
         return ASK_COUNT
@@ -455,7 +561,7 @@ async def receive_count(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     count = int(text)
     if count < 1 or count > limit:
         await send_safe(update.message.reply_text(
-            f"⚠️ *Out of range*\n\n"
+            f"\u26a0\ufe0f *Out of range*\n\n"
             f"Please enter a number between `1` and `{escape_md(fmt(limit))}`\\.",
             parse_mode=ParseMode.MARKDOWN_V2,
         ))
@@ -463,7 +569,7 @@ async def receive_count(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
     context.user_data["count"] = count
     await send_safe(update.message.reply_text(
-        f"✅ *{escape_md(fmt(count))} wallets* selected\\.\n\n"
+        f"\u2705 *{escape_md(fmt(count))} wallets* selected\\.\n\n"
         "Choose your *mnemonic phrase length*\\:\n\n"
         "_Longer phrase \\= higher entropy \\= more secure_",
         parse_mode=ParseMode.MARKDOWN_V2,
@@ -505,16 +611,14 @@ async def receive_words(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         return ConversationHandler.END
 
     context.user_data["word_count"] = word_count
-
-    # Show cost preview on export selection screen
-    cost_csv = escape_md(fmt_credits(cost_for(count, "exp_csv")))
-    cost_tg  = escape_md(fmt_credits(cost_for(count, "exp_tg")))
+    cost_csv = escape_md(fmt_pts(cost_for(count, "exp_csv")))
+    cost_tg  = escape_md(fmt_pts(cost_for(count, "exp_tg")))
 
     await send_safe(query.edit_message_text(
-        f"✅ *{escape_md(fmt(count))} wallets* \\| *{word_count} words* selected\\.\n\n"
+        f"\u2705 *{escape_md(fmt(count))} wallets* \\| *{word_count} words* selected\\.\n\n"
         "Choose your *export type*\\:\n\n"
-        f"📄 CSV \\- costs `{cost_csv}` PTS\n"
-        f"💬 TG Messages \\- costs `{cost_tg}` PTS",
+        f"\U0001f4c4 CSV \\- costs `{cost_csv}` PTS\n"
+        f"\U0001f4ac TG Messages \\- costs `{cost_tg}` PTS",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("📄 CSV File",    callback_data="exp_csv"),
@@ -538,22 +642,21 @@ async def receive_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         ))
         return ConversationHandler.END
 
-    uid  = update.effective_user.id
-    user = get_user(uid)
-
-    # ---- Balance check ----
+    uid      = update.effective_user.id
+    user     = get_user(uid)
     required = cost_for(count, export_type)
+
     if user["credits"] < required:
         shortage     = required - user["credits"]
         export_label = "CSV" if export_type == "exp_csv" else "TG Messages"
         await send_safe(query.edit_message_text(
-            f"❌ *Insufficient Credits*\n"
-            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"\u274c *Insufficient Credits*\n"
+            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
             f"*Export type:* `{escape_md(export_label)}`\n"
             f"*Wallets:* `{escape_md(fmt(count))}`\n"
-            f"*Cost:* `{escape_md(fmt_credits(required))}` PTS\n"
-            f"*Your balance:* `{escape_md(fmt_credits(user['credits']))}` PTS\n"
-            f"*Shortfall:* `{escape_md(fmt_credits(shortage))}` PTS\n\n"
+            f"*Cost:* `{escape_md(fmt_pts(required))}` PTS\n"
+            f"*Your balance:* `{escape_md(fmt_pts(user['credits']))}` PTS\n"
+            f"*Shortfall:* `{escape_md(fmt_pts(shortage))}` PTS\n\n"
             "Please contact an admin to top up your balance\\.",
             parse_mode=ParseMode.MARKDOWN_V2,
             reply_markup=back_kb(),
@@ -565,12 +668,12 @@ async def receive_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     export_label = "CSV file" if export_type == "exp_csv" else "TG messages"
 
     await send_safe(query.edit_message_text(
-        f"⚙️ *Generating {escape_md(fmt(count))} wallets\\.\\.\\.*\n\n"
+        f"\u2699\ufe0f *Generating {escape_md(fmt(count))} wallets\\.\\.\\.*\n\n"
         f"\\- Mnemonic: `{word_count} words`\n"
         f"\\- Derivation: `{escape_md(DERIVATION_PATH)}`\n"
         f"\\- Export as: `{escape_md(export_label)}`\n"
         f"\\- Estimated time: `{escape_md(est)}`\n"
-        f"\\- Cost: `{escape_md(fmt_credits(required))}` PTS\n\n"
+        f"\\- Cost: `{escape_md(fmt_pts(required))}` PTS\n\n"
         "_Please wait \\- this happens automatically\\._",
         parse_mode=ParseMode.MARKDOWN_V2,
     ))
@@ -580,14 +683,14 @@ async def receive_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     except Exception as exc:
         logger.exception("Wallet generation failed: %s", exc)
         await send_safe(query.message.reply_text(
-            "❌ *Generation failed*\n\nAn unexpected error occurred\\. "
+            "\u274c *Generation failed*\n\nAn unexpected error occurred\\. "
             "Please try again with /start\\.",
             parse_mode=ParseMode.MARKDOWN_V2,
         ))
         context.user_data.clear()
         return ConversationHandler.END
 
-    # Deduct balance AFTER successful generation, before delivery
+    # Deduct PTS after successful generation
     user["credits"]           -= required
     user["wallets_generated"] += count
 
@@ -599,11 +702,10 @@ async def receive_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await _deliver_tg(query, context, rows, count, elapsed)
 
     context.user_data.clear()
-
-    remaining = escape_md(fmt_credits(user["credits"]))
+    remaining = escape_md(fmt_pts(user["credits"]))
     await send_safe(query.message.reply_text(
-        "🏁 *All done\\!*\n\n"
-        f"💳 *Remaining Credit:* `{remaining}` PTS\n\n"
+        "\U0001f3c1 *All done\\!*\n\n"
+        f"\U0001f4b3 *Remaining Credit:* `{remaining}` PTS\n\n"
         "Need another batch? Use /start anytime\\.",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=back_kb(),
@@ -620,11 +722,11 @@ async def _deliver_csv(query, rows: list, count: int, elapsed: str) -> None:
                 document=f,
                 filename=filename,
                 caption=(
-                    f"✅ *{escape_md(fmt(count))} wallets generated*\n\n"
-                    f"📄 File: `{escape_md(filename)}`\n"
-                    f"⏱ Time: `{escape_md(elapsed)}`\n"
-                    f"🔑 Columns: `#`, `address`, `private_key`, `mnemonic`\n\n"
-                    "⚠️ *Security reminder*\n"
+                    f"\u2705 *{escape_md(fmt(count))} wallets generated*\n\n"
+                    f"\U0001f4c4 File: `{escape_md(filename)}`\n"
+                    f"\u23f1 Time: `{escape_md(elapsed)}`\n"
+                    f"\U0001f511 Columns: `#`, `address`, `private_key`, `mnemonic`\n\n"
+                    "\u26a0\ufe0f *Security reminder*\n"
                     "Store this file in an encrypted location\\.\n"
                     "Never share your private keys or mnemonic phrases\\."
                 ),
@@ -633,7 +735,7 @@ async def _deliver_csv(query, rows: list, count: int, elapsed: str) -> None:
     except Exception as exc:
         logger.exception("Failed to send CSV: %s", exc)
         await send_safe(query.message.reply_text(
-            "❌ *Delivery failed*\n\nCould not send the file\\. Please try again with /start\\.",
+            "\u274c *Delivery failed*\n\nCould not send the file\\. Please try again with /start\\.",
             parse_mode=ParseMode.MARKDOWN_V2,
         ))
     finally:
@@ -645,7 +747,7 @@ async def _deliver_csv(query, rows: list, count: int, elapsed: str) -> None:
 async def _deliver_tg(query, context, rows: list, count: int, elapsed: str) -> None:
     total_msgs = math.ceil(len(rows) / TG_WALLETS_PER_MSG)
     await send_safe(query.message.reply_text(
-        f"📨 Sending *{escape_md(fmt(count))} wallets* "
+        f"\U0001f4e8 Sending *{escape_md(fmt(count))} wallets* "
         f"in *{escape_md(str(total_msgs))} messages* "
         f"\\({TG_WALLETS_PER_MSG} per message\\)\\.\\.\\.",
         parse_mode=ParseMode.MARKDOWN_V2,
@@ -673,12 +775,90 @@ async def _deliver_tg(query, context, rows: list, count: int, elapsed: str) -> N
         await asyncio.sleep(TG_MSG_DELAY)
 
     await send_safe(query.message.reply_text(
-        f"✅ *{escape_md(fmt(count))} wallets sent*\n"
-        f"⏱ Time: `{escape_md(elapsed)}`\n\n"
-        "⚠️ *Security reminder*\n"
+        f"\u2705 *{escape_md(fmt(count))} wallets sent*\n"
+        f"\u23f1 Time: `{escape_md(elapsed)}`\n\n"
+        "\u26a0\ufe0f *Security reminder*\n"
         "Never share your private keys or mnemonic phrases\\.",
         parse_mode=ParseMode.MARKDOWN_V2,
     ))
+
+# ============================================================================
+# ADMIN: HOME
+# ============================================================================
+async def admin_home(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    await send_safe(query.edit_message_text(
+        WELCOME_ADMIN,
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=admin_menu_kb(),
+    ))
+    return ConversationHandler.END
+
+# ============================================================================
+# ADMIN: USER INFO
+# ============================================================================
+async def adm_userinfo_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    await send_safe(query.edit_message_text(
+        "*\U0001f464 User Info*\n"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
+        "Send the user's *Telegram ID* or *@username*\\.\n"
+        "_You can look up multiple users in a row\\._",
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=admin_back_kb(),
+    ))
+    return ADM_USERINFO_QUERY
+
+async def adm_userinfo_lookup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not is_admin_group(update):
+        return ADM_USERINFO_QUERY
+
+    q         = update.message.text.strip()
+    uid, user = find_user(q)
+
+    if user is None:
+        await send_safe(update.message.reply_text(
+            f"\u26a0\ufe0f No user found for `{escape_md(q)}`\\.\n\n"
+            "Make sure the user has started the bot first\\.",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        ))
+        return ADM_USERINFO_QUERY
+
+    name      = escape_md(user["name"] or "N/A")
+    username  = escape_md("@" + user["username"] if user["username"] else "N/A")
+    pts       = escape_md(fmt_pts(user["credits"]))
+    generated = escape_md(fmt(user["wallets_generated"]))
+    checked   = escape_md(fmt(user["balance_checked"]))
+    rate_tg   = escape_md(fmt_pts(get_rate_tg()))
+    rate_csv  = escape_md(fmt_pts(get_rate_csv()))
+    limit     = escape_md(fmt(get_global_limit()))
+
+    expiry_line = ""
+    if uid in GRANTED_USERS:
+        exp = datetime.utcfromtimestamp(GRANTED_USERS[uid]).strftime("%Y-%m-%d %H:%M UTC")
+        expiry_line = f"*Access Expires:* `{escape_md(exp)}`\n"
+
+    text = (
+        "*\U0001f464 User Profile*\n"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
+        f"*Name:* {name}\n"
+        f"*User ID:* `{uid}`\n"
+        f"*Username:* {username}\n"
+        f"{expiry_line}\n"
+        f"*Remaining Credit:* `{pts}` PTS\n\n"
+        f"*Wallets Generated:* `{generated}`\n"
+        f"*Wallet Limit:* `{limit}`\n"
+        f"*Balance Checked:* `{checked}`\n\n"
+        f"*Rate Per 1,000 Generate \\(TG\\):* `{rate_tg}` PTS\n"
+        f"*Rate Per 1,000 Generate \\(CSV\\):* `{rate_csv}` PTS\n"
+        f"*Rate Per 1,000 CSV Balance Check:* `coming soon`\n"
+    )
+    await send_safe(update.message.reply_text(
+        text, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=admin_back_kb()
+    ))
+    return ADM_USERINFO_QUERY
 
 # ============================================================================
 # ADMIN: BALANCE PANEL
@@ -686,10 +866,10 @@ async def _deliver_tg(query, context, rows: list, count: int, elapsed: str) -> N
 async def adm_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
-    join_bal = escape_md(fmt_credits(get_join_balance()))
+    join_bal = escape_md(fmt_pts(get_join_balance()))
     await send_safe(query.edit_message_text(
-        "*💰 Balance*\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "*\U0001f4b0 Balance*\n"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
         f"*Current join balance:* `{join_bal}` PTS\n\n"
         "Select an action\\:",
         parse_mode=ParseMode.MARKDOWN_V2,
@@ -697,14 +877,13 @@ async def adm_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     ))
     return ConversationHandler.END
 
-# -- Add User Balance --------------------------------------------------------
 async def adm_bal_add_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
     await send_safe(query.edit_message_text(
-        "*➕ Add User Balance*\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "Send the *Telegram ID* or *@username* of the user you want to top up\\.",
+        "*\u2795 Add User Balance*\n"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
+        "Send the *Telegram ID* or *@username* of the user to top up\\.",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=adm_balance_back_kb(),
     ))
@@ -715,20 +894,18 @@ async def adm_bal_add_uid(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return ADM_ADD_BAL_UID
 
     q        = update.message.text.strip()
-    uid, user = find_user_by_query(q)
+    uid, user = find_user(q)
 
     if user is None:
         await send_safe(update.message.reply_text(
-            f"⚠️ No user found for `{escape_md(q)}`\\.\n\n"
-            "Make sure the user has started the bot first\\.",
+            f"\u26a0\ufe0f No user found for `{escape_md(q)}`\\.",
             parse_mode=ParseMode.MARKDOWN_V2,
         ))
         return ADM_ADD_BAL_UID
 
     context.user_data["bal_target_uid"] = uid
     name    = escape_md(user["name"])
-    current = escape_md(fmt_credits(user["credits"]))
-
+    current = escape_md(fmt_pts(user["credits"]))
     await send_safe(update.message.reply_text(
         f"User found: *{name}* \\(`{uid}`\\)\n"
         f"Current balance: `{current}` PTS\n\n"
@@ -747,7 +924,7 @@ async def adm_bal_add_amt(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             raise ValueError
     except ValueError:
         await send_safe(update.message.reply_text(
-            "⚠️ Please send a valid positive number \\(e\\.g\\. `5` or `0\\.5`\\)\\.",
+            "\u26a0\ufe0f Please send a valid positive number\\.",
             parse_mode=ParseMode.MARKDOWN_V2,
         ))
         return ADM_ADD_BAL_AMT
@@ -766,10 +943,10 @@ async def adm_bal_add_amt(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     name    = escape_md(USER_DB[uid]["name"])
 
     await send_safe(update.message.reply_text(
-        f"✅ *Balance updated\\!*\n\n"
+        f"\u2705 *Balance updated\\!*\n\n"
         f"User: *{name}* \\(`{uid}`\\)\n"
-        f"Added: `{escape_md(fmt_credits(amount))}` PTS\n"
-        f"New balance: `{escape_md(fmt_credits(new_bal))}` PTS",
+        f"Added: `{escape_md(fmt_pts(amount))}` PTS\n"
+        f"New balance: `{escape_md(fmt_pts(new_bal))}` PTS",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("➕ Add to Another User", callback_data="adm_bal_add")],
@@ -779,16 +956,15 @@ async def adm_bal_add_amt(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     context.user_data.clear()
     return ConversationHandler.END
 
-# -- New User Join Balance ---------------------------------------------------
 async def adm_bal_join_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
-    current = escape_md(fmt_credits(get_join_balance()))
+    current = escape_md(fmt_pts(get_join_balance()))
     await send_safe(query.edit_message_text(
-        "*🎁 New User Join Balance*\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "*\U0001f381 New User Join Balance*\n"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
         f"Current join balance: `{current}` PTS\n\n"
-        "Every new user gets this amount when they first start the bot\\.\n\n"
+        "Every new user gets this amount on first /start\\.\n\n"
         "Send the *new join balance* \\(e\\.g\\. `1` or `0`\\)\\:",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=adm_balance_back_kb(),
@@ -805,15 +981,15 @@ async def adm_bal_join_set(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             raise ValueError
     except ValueError:
         await send_safe(update.message.reply_text(
-            "⚠️ Please send a valid non-negative number \\(e\\.g\\. `1` or `0`\\)\\.",
+            "\u26a0\ufe0f Please send a valid non-negative number\\.",
             parse_mode=ParseMode.MARKDOWN_V2,
         ))
         return ADM_SET_JOIN_BAL
 
     set_join_balance(val)
     await send_safe(update.message.reply_text(
-        f"✅ *Join balance updated\\!*\n\n"
-        f"New users will receive `{escape_md(fmt_credits(val))}` PTS on first /start\\.\n"
+        f"\u2705 *Join balance updated\\!*\n\n"
+        f"New users will receive `{escape_md(fmt_pts(val))}` PTS on first /start\\.\n"
         "_Existing users are not affected\\._",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=InlineKeyboardMarkup([[
@@ -826,22 +1002,12 @@ async def adm_bal_join_set(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 # ============================================================================
 # ADMIN: RATE TREE
 # ============================================================================
-async def admin_home(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    await send_safe(query.edit_message_text(
-        WELCOME_ADMIN,
-        parse_mode=ParseMode.MARKDOWN_V2,
-        reply_markup=admin_menu_kb(),
-    ))
-    return ConversationHandler.END
-
 async def adm_rate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
     await send_safe(query.edit_message_text(
-        "*📊 Rate*\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "*\U0001f4ca Rate*\n"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
         "Select a category to configure rates\\.",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=adm_rate_kb(),
@@ -850,11 +1016,11 @@ async def adm_rate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def adm_rate_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
-    csv_rate = escape_md(fmt_credits(get_rate_csv()))
-    tg_rate  = escape_md(fmt_credits(get_rate_tg()))
+    csv_rate = escape_md(fmt_pts(get_rate_csv()))
+    tg_rate  = escape_md(fmt_pts(get_rate_tg()))
     await send_safe(query.edit_message_text(
-        "*💸 Wallet Generate Rate*\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "*\U0001f4b8 Wallet Generate Rate*\n"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
         f"*Per 1,000 CSV Export:* `{csv_rate}` PTS\n"
         f"*Per 1,000 TG Message Export:* `{tg_rate}` PTS\n\n"
         "Select a rate to update\\:",
@@ -865,10 +1031,10 @@ async def adm_rate_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def adm_rate_csv_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
-    current = escape_md(fmt_credits(get_rate_csv()))
+    current = escape_md(fmt_pts(get_rate_csv()))
     await send_safe(query.edit_message_text(
-        "*📄 Per 1,000 CSV Rate*\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "*\U0001f4c4 Per 1,000 CSV Rate*\n"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
         f"Current rate: `{current}` PTS per 1,000 wallets\n\n"
         "Send the *new rate* \\(e\\.g\\. `0\\.01`\\)\\:",
         parse_mode=ParseMode.MARKDOWN_V2,
@@ -887,15 +1053,15 @@ async def adm_rate_csv_set(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             raise ValueError
     except ValueError:
         await send_safe(update.message.reply_text(
-            "⚠️ Please send a valid positive number \\(e\\.g\\. `0\\.01`\\)\\.",
+            "\u26a0\ufe0f Please send a valid positive number\\.",
             parse_mode=ParseMode.MARKDOWN_V2,
         ))
         return ADM_SET_RATE_CSV_VAL
 
     set_rate_csv(val)
     await send_safe(update.message.reply_text(
-        f"✅ *CSV rate updated\\!*\n\n"
-        f"New rate: `{escape_md(fmt_credits(val))}` PTS per 1,000 wallets\n"
+        f"\u2705 *CSV rate updated\\!*\n\n"
+        f"New rate: `{escape_md(fmt_pts(val))}` PTS per 1,000 wallets\n"
         "Applied globally immediately\\.",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=InlineKeyboardMarkup([[
@@ -908,10 +1074,10 @@ async def adm_rate_csv_set(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def adm_rate_tg_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
-    current = escape_md(fmt_credits(get_rate_tg()))
+    current = escape_md(fmt_pts(get_rate_tg()))
     await send_safe(query.edit_message_text(
-        "*💬 Per 1,000 TG Message Rate*\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "*\U0001f4ac Per 1,000 TG Message Rate*\n"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
         f"Current rate: `{current}` PTS per 1,000 wallets\n\n"
         "Send the *new rate* \\(e\\.g\\. `0\\.03`\\)\\:",
         parse_mode=ParseMode.MARKDOWN_V2,
@@ -930,15 +1096,15 @@ async def adm_rate_tg_set(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             raise ValueError
     except ValueError:
         await send_safe(update.message.reply_text(
-            "⚠️ Please send a valid positive number \\(e\\.g\\. `0\\.03`\\)\\.",
+            "\u26a0\ufe0f Please send a valid positive number\\.",
             parse_mode=ParseMode.MARKDOWN_V2,
         ))
         return ADM_SET_RATE_TG_VAL
 
     set_rate_tg(val)
     await send_safe(update.message.reply_text(
-        f"✅ *TG Message rate updated\\!*\n\n"
-        f"New rate: `{escape_md(fmt_credits(val))}` PTS per 1,000 wallets\n"
+        f"\u2705 *TG Message rate updated\\!*\n\n"
+        f"New rate: `{escape_md(fmt_pts(val))}` PTS per 1,000 wallets\n"
         "Applied globally immediately\\.",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=InlineKeyboardMarkup([[
@@ -949,67 +1115,6 @@ async def adm_rate_tg_set(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     return ConversationHandler.END
 
 # ============================================================================
-# ADMIN: USER INFO
-# ============================================================================
-async def adm_userinfo_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    await send_safe(query.edit_message_text(
-        "*👤 User Info*\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "Send the user's *Telegram ID* or *@username* to look up their profile\\.\n\n"
-        "_You can look up multiple users in a row\\._",
-        parse_mode=ParseMode.MARKDOWN_V2,
-        reply_markup=admin_back_kb(),
-    ))
-    return ADM_USERINFO_QUERY
-
-async def adm_userinfo_lookup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not is_admin_group(update):
-        return ADM_USERINFO_QUERY
-
-    q         = update.message.text.strip()
-    uid, user = find_user_by_query(q)
-
-    if user is None:
-        await send_safe(update.message.reply_text(
-            f"⚠️ No user found for `{escape_md(q)}`\\.\n\n"
-            "Make sure the user has started the bot first\\.",
-            parse_mode=ParseMode.MARKDOWN_V2,
-        ))
-        return ADM_USERINFO_QUERY
-
-    name      = escape_md(user["name"] or "N/A")
-    username  = escape_md("@" + user["username"] if user["username"] else "N/A")
-    credits   = escape_md(fmt_credits(user["credits"]))
-    generated = escape_md(fmt(user["wallets_generated"]))
-    checked   = escape_md(fmt(user["balance_checked"]))
-    rate_tg   = escape_md(fmt_credits(get_rate_tg()))
-    rate_csv  = escape_md(fmt_credits(get_rate_csv()))
-    limit     = escape_md(fmt(get_global_limit()))
-
-    text = (
-        "*👤 User Profile*\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"*Name:* {name}\n"
-        f"*User ID:* `{uid}`\n"
-        f"*Username:* {username}\n\n"
-        f"*Remaining Credit:* `{credits}` PTS\n\n"
-        f"*Wallets Generated:* `{generated}`\n"
-        f"*Wallet Limit:* `{limit}`\n"
-        f"*Balance Checked:* `{checked}`\n\n"
-        f"*Rate Per 1,000 Generate \\(TG\\):* `{rate_tg}` PTS\n"
-        f"*Rate Per 1,000 Generate \\(CSV\\):* `{rate_csv}` PTS\n"
-        f"*Rate Per 1,000 CSV Balance Check:* `coming soon`\n"
-    )
-    await send_safe(update.message.reply_text(
-        text,
-        parse_mode=ParseMode.MARKDOWN_V2,
-        reply_markup=admin_back_kb(),
-    ))
-    return ADM_USERINFO_QUERY
-
-# ============================================================================
 # ADMIN: WALLET LIMIT
 # ============================================================================
 async def adm_wlimit_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1017,8 +1122,8 @@ async def adm_wlimit_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await query.answer()
     current = escape_md(fmt(get_global_limit()))
     await send_safe(query.edit_message_text(
-        "*🔢 Wallet Generate Limit*\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "*\U0001f522 Wallet Generate Limit*\n"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
         f"Current global limit: `{current}` wallets\n\n"
         "This applies to *all users* immediately\\.\n\n"
         "Send the *new limit* \\(1 to 100,000,000\\)\\:",
@@ -1034,7 +1139,7 @@ async def adm_wlimit_set(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     text = update.message.text.strip()
     if not text.isdigit():
         await send_safe(update.message.reply_text(
-            "⚠️ Please send a valid number\\.",
+            "\u26a0\ufe0f Please send a valid number\\.",
             parse_mode=ParseMode.MARKDOWN_V2,
         ))
         return ADM_SET_LIMIT_VAL
@@ -1042,21 +1147,251 @@ async def adm_wlimit_set(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     new_limit = int(text)
     if new_limit < 1 or new_limit > 100_000_000:
         await send_safe(update.message.reply_text(
-            "⚠️ Limit must be between `1` and `100,000,000`\\.",
+            "\u26a0\ufe0f Limit must be between `1` and `100,000,000`\\.",
             parse_mode=ParseMode.MARKDOWN_V2,
         ))
         return ADM_SET_LIMIT_VAL
 
     set_global_limit(new_limit)
     await send_safe(update.message.reply_text(
-        f"✅ *Global wallet limit updated\\!*\n\n"
+        f"\u2705 *Global wallet limit updated\\!*\n\n"
         f"New limit: `{escape_md(fmt(new_limit))}` wallets\n"
-        "Applied to all users immediately\\.\n\n"
-        "_You can update this limit again anytime\\._",
+        "Applied to all users immediately\\.",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("🔄 Update Again", callback_data="adm_wlimit"),
             InlineKeyboardButton("⬅️ Back",         callback_data="adm_home"),
+        ]]),
+    ))
+    context.user_data.clear()
+    return ConversationHandler.END
+
+# ============================================================================
+# ADMIN: ACCESS MANAGEMENT
+# ============================================================================
+async def adm_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    now    = time.time()
+    active = sum(1 for v in ACCESS_CODES.values() if v["expires_at"] > now)
+    await send_safe(query.edit_message_text(
+        "*\U0001f510 Access Management*\n"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
+        f"Active codes: `{active}`\n"
+        f"Granted users: `{len(GRANTED_USERS)}`\n\n"
+        "Select an action\\:",
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🎫 Issue Access Code", callback_data="adm_ac_issue")],
+            [InlineKeyboardButton("⬅️ Back",              callback_data="adm_home")],
+        ]),
+    ))
+
+async def adm_ac_issue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    await send_safe(query.edit_message_text(
+        "*\U0001f3ab Issue Access Code*\n"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
+        "Choose the access code type\\:",
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🎲 Random User",  callback_data="adm_ac_random")],
+            [InlineKeyboardButton("🎯 Custom User",  callback_data="adm_ac_custom")],
+            [InlineKeyboardButton("⬅️ Back",         callback_data="adm_access")],
+        ]),
+    ))
+
+# ---- RANDOM FLOW -----------------------------------------------------------
+async def adm_ac_random_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    context.user_data.clear()
+    context.user_data["ac_type"] = "random"
+    await send_safe(query.edit_message_text(
+        "*\U0001f3b2 Random User Access Code*\n"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
+        "How many users can redeem this code?\n"
+        "_Send a number, e.g. `5`_",
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("⬅️ Back", callback_data="adm_ac_issue")
+        ]]),
+    ))
+    return ADM_AC_RANDOM_COUNT
+
+async def adm_ac_random_count(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not is_admin_group(update):
+        return ADM_AC_RANDOM_COUNT
+
+    text = update.message.text.strip()
+    if not text.isdigit() or int(text) < 1:
+        await send_safe(update.message.reply_text(
+            "\u26a0\ufe0f Please send a valid positive number\\.",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        ))
+        return ADM_AC_RANDOM_COUNT
+
+    context.user_data["ac_slots"] = int(text)
+    await send_safe(update.message.reply_text(
+        "*Set Validation Period*\n"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
+        f"`{context.user_data['ac_slots']}` slot\\(s\\) set\\.\n\n"
+        "How long should this code be valid?",
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("⏰ Hourly", callback_data="adm_ac_val_hourly"),
+            InlineKeyboardButton("📅 Days",   callback_data="adm_ac_val_days"),
+        ]]),
+    ))
+    return ADM_AC_VAL_TYPE
+
+# ---- CUSTOM FLOW -----------------------------------------------------------
+async def adm_ac_custom_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    context.user_data.clear()
+    context.user_data["ac_type"]        = "custom"
+    context.user_data["ac_custom_uids"] = []
+    await send_safe(query.edit_message_text(
+        "*\U0001f3af Custom User Access Code*\n"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
+        "Send the *Telegram User ID* of the first user\\.",
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("⬅️ Back", callback_data="adm_ac_issue")
+        ]]),
+    ))
+    return ADM_AC_CUSTOM_UID
+
+async def adm_ac_custom_uid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not is_admin_group(update):
+        return ADM_AC_CUSTOM_UID
+
+    text = update.message.text.strip()
+    if not text.isdigit():
+        await send_safe(update.message.reply_text(
+            "\u26a0\ufe0f Please send a valid numeric Telegram User ID\\.",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        ))
+        return ADM_AC_CUSTOM_UID
+
+    uid_list = context.user_data.setdefault("ac_custom_uids", [])
+    uid_val  = int(text)
+
+    if uid_val in uid_list:
+        await send_safe(update.message.reply_text(
+            f"\u26a0\ufe0f User `{uid_val}` is already added\\.",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        ))
+        return ADM_AC_CUSTOM_UID
+
+    uid_list.append(uid_val)
+    ids_display = escape_md(", ".join(str(u) for u in uid_list))
+
+    await send_safe(update.message.reply_text(
+        f"\u2705 Added `{uid_val}`\\.\n\n"
+        f"*Users so far \\({len(uid_list)}\\):* {ids_display}\n\n"
+        "Send another User ID, or tap *Done* to set validation\\.",
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Done, Set Validation", callback_data="adm_ac_custom_done")
+        ]]),
+    ))
+    return ADM_AC_CUSTOM_UID
+
+async def adm_ac_custom_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    uid_list = context.user_data.get("ac_custom_uids", [])
+    await send_safe(query.edit_message_text(
+        "*Set Validation Period*\n"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
+        f"`{escape_md(str(len(uid_list)))}` user\\(s\\) added\\.\n\n"
+        "How long should this code be valid?",
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("⏰ Hourly", callback_data="adm_ac_val_hourly"),
+            InlineKeyboardButton("📅 Days",   callback_data="adm_ac_val_days"),
+        ]]),
+    ))
+    return ADM_AC_VAL_TYPE
+
+# ---- SHARED: VALIDATION TYPE + AMOUNT + CODE GENERATION -------------------
+async def adm_ac_val_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    val_type = "hours" if query.data == "adm_ac_val_hourly" else "days"
+    context.user_data["ac_val_type"] = val_type
+    unit = "hours" if val_type == "hours" else "days"
+    await send_safe(query.edit_message_text(
+        f"*Validation Amount*\n\n"
+        f"How many *{escape_md(unit)}* should this code be valid for?\n"
+        "_Send a number, e.g. `24`_",
+        parse_mode=ParseMode.MARKDOWN_V2,
+    ))
+    return ADM_AC_VAL_AMT
+
+async def adm_ac_val_amt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not is_admin_group(update):
+        return ADM_AC_VAL_AMT
+
+    text = update.message.text.strip()
+    if not text.isdigit() or int(text) < 1:
+        await send_safe(update.message.reply_text(
+            "\u26a0\ufe0f Please send a valid positive number\\.",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        ))
+        return ADM_AC_VAL_AMT
+
+    amount   = int(text)
+    val_type = context.user_data.get("ac_val_type", "hours")
+    hours    = amount if val_type == "hours" else amount * 24
+    expires  = time.time() + hours * 3600
+    ac_type  = context.user_data.get("ac_type", "random")
+
+    # Generate unique 8-char code
+    while True:
+        code = _make_code()
+        if code not in ACCESS_CODES:
+            break
+
+    if ac_type == "random":
+        slots = context.user_data.get("ac_slots", 1)
+        ACCESS_CODES[code] = {
+            "type":         "random",
+            "slots":        slots,
+            "allowed_uids": set(),
+            "used_uids":    set(),
+            "expires_at":   expires,
+        }
+        type_detail = escape_md(f"Random ({slots} slot(s))")
+    else:
+        uids = set(context.user_data.get("ac_custom_uids", []))
+        ACCESS_CODES[code] = {
+            "type":         "custom",
+            "slots":        len(uids),
+            "allowed_uids": uids,
+            "used_uids":    set(),
+            "expires_at":   expires,
+        }
+        type_detail = f"Custom \\({escape_md(', '.join(str(u) for u in uids))}\\)"
+
+    expiry_dt   = datetime.utcfromtimestamp(expires).strftime("%Y-%m-%d %H:%M UTC")
+    val_display = escape_md(f"{amount} {'hour(s)' if val_type == 'hours' else 'day(s)'}")
+
+    await send_safe(update.message.reply_text(
+        f"\u2705 *Access Code Issued\\!*\n"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
+        f"*Code:* `{code}`\n"
+        f"*Type:* {type_detail}\n"
+        f"*Valid for:* {val_display}\n"
+        f"*Expires:* `{escape_md(expiry_dt)}`\n\n"
+        "Share this code with your users\\.",
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🎫 Issue Another", callback_data="adm_ac_issue"),
+            InlineKeyboardButton("⬅️ Back",          callback_data="adm_home"),
         ]]),
     ))
     context.user_data.clear()
@@ -1069,12 +1404,12 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
     if is_private(update):
         await send_safe(update.message.reply_text(
-            "🚫 *Session cancelled\\.*\n\nUse /start whenever you're ready\\.",
+            "\U0001f6ab *Session cancelled\\.*\n\nUse /start whenever you're ready\\.",
             parse_mode=ParseMode.MARKDOWN_V2,
         ))
     elif is_admin_group(update):
         await send_safe(update.message.reply_text(
-            "🚫 Admin action cancelled\\. Use /start to open the admin panel\\.",
+            "\U0001f6ab Admin action cancelled\\. Use /start to open the admin panel\\.",
             parse_mode=ParseMode.MARKDOWN_V2,
         ))
     return ConversationHandler.END
@@ -1103,12 +1438,20 @@ def main() -> None:
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # User: Bulk Wallet Generator
+    # User conversation: access gate + bulk wallet generator
     user_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(bulk_entry, pattern="^menu_bulk$")],
+        entry_points=[
+            CommandHandler("start", start),
+            CallbackQueryHandler(bulk_entry, pattern="^menu_bulk$"),
+        ],
         states={
+            USER_ENTER_CODE: [MessageHandler(
+                filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
+                user_enter_code,
+            )],
             ASK_COUNT:  [MessageHandler(
-                filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, receive_count
+                filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
+                receive_count,
             )],
             ASK_WORDS:  [CallbackQueryHandler(receive_words,  pattern=r"^wc_(12|15|18|21|24)$")],
             ASK_EXPORT: [CallbackQueryHandler(receive_export, pattern="^exp_(csv|tg)$")],
@@ -1120,29 +1463,23 @@ def main() -> None:
         allow_reentry=True,
     )
 
-    # Admin: User Info lookup
+    # Admin: User Info
     admin_userinfo_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(adm_userinfo_prompt, pattern="^adm_userinfo$")],
         states={
             ADM_USERINFO_QUERY: [MessageHandler(filters.TEXT & ~filters.COMMAND, adm_userinfo_lookup)],
         },
-        fallbacks=[
-            CommandHandler("cancel", cancel),
-            CallbackQueryHandler(admin_home, pattern="^adm_home$"),
-        ],
+        fallbacks=[CommandHandler("cancel", cancel), CallbackQueryHandler(admin_home, pattern="^adm_home$")],
         allow_reentry=True,
     )
 
-    # Admin: Global Wallet Limit
+    # Admin: Wallet Limit
     admin_wlimit_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(adm_wlimit_prompt, pattern="^adm_wlimit$")],
         states={
             ADM_SET_LIMIT_VAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, adm_wlimit_set)],
         },
-        fallbacks=[
-            CommandHandler("cancel", cancel),
-            CallbackQueryHandler(admin_home, pattern="^adm_home$"),
-        ],
+        fallbacks=[CommandHandler("cancel", cancel), CallbackQueryHandler(admin_home, pattern="^adm_home$")],
         allow_reentry=True,
     )
 
@@ -1191,7 +1528,7 @@ def main() -> None:
         allow_reentry=True,
     )
 
-    # Admin: New User Join Balance
+    # Admin: Join Balance
     admin_join_bal_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(adm_bal_join_prompt, pattern="^adm_bal_join$")],
         states={
@@ -1205,12 +1542,42 @@ def main() -> None:
         allow_reentry=True,
     )
 
-    # Commands
-    app.add_handler(CommandHandler("start",  start))
-    app.add_handler(CommandHandler("help",   help_command))
-    app.add_handler(CommandHandler("cancel", cancel))
+    # Admin: Access Management (random flow)
+    admin_ac_random_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(adm_ac_random_start, pattern="^adm_ac_random$")],
+        states={
+            ADM_AC_RANDOM_COUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, adm_ac_random_count)],
+            ADM_AC_VAL_TYPE:     [CallbackQueryHandler(adm_ac_val_type, pattern="^adm_ac_val_(hourly|days)$")],
+            ADM_AC_VAL_AMT:      [MessageHandler(filters.TEXT & ~filters.COMMAND, adm_ac_val_amt)],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            CallbackQueryHandler(adm_ac_issue, pattern="^adm_ac_issue$"),
+            CallbackQueryHandler(admin_home,   pattern="^adm_home$"),
+        ],
+        allow_reentry=True,
+    )
 
-    # Conversations
+    # Admin: Access Management (custom flow)
+    admin_ac_custom_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(adm_ac_custom_start, pattern="^adm_ac_custom$")],
+        states={
+            ADM_AC_CUSTOM_UID: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, adm_ac_custom_uid),
+                CallbackQueryHandler(adm_ac_custom_done, pattern="^adm_ac_custom_done$"),
+            ],
+            ADM_AC_VAL_TYPE: [CallbackQueryHandler(adm_ac_val_type, pattern="^adm_ac_val_(hourly|days)$")],
+            ADM_AC_VAL_AMT:  [MessageHandler(filters.TEXT & ~filters.COMMAND, adm_ac_val_amt)],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            CallbackQueryHandler(adm_ac_issue, pattern="^adm_ac_issue$"),
+            CallbackQueryHandler(admin_home,   pattern="^adm_home$"),
+        ],
+        allow_reentry=True,
+    )
+
+    # Register conversations (order matters)
     app.add_handler(user_conv)
     app.add_handler(admin_userinfo_conv)
     app.add_handler(admin_wlimit_conv)
@@ -1218,6 +1585,12 @@ def main() -> None:
     app.add_handler(admin_rate_tg_conv)
     app.add_handler(admin_add_bal_conv)
     app.add_handler(admin_join_bal_conv)
+    app.add_handler(admin_ac_random_conv)
+    app.add_handler(admin_ac_custom_conv)
+
+    # Commands
+    app.add_handler(CommandHandler("help",   help_command))
+    app.add_handler(CommandHandler("cancel", cancel))
 
     # Static callbacks (private)
     app.add_handler(CallbackQueryHandler(menu_home,     pattern="^menu_home$"))
@@ -1226,10 +1599,12 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(menu_balance,  pattern="^menu_balance$"))
 
     # Static callbacks (admin)
-    app.add_handler(CallbackQueryHandler(admin_home,       pattern="^adm_home$"))
-    app.add_handler(CallbackQueryHandler(adm_balance,      pattern="^adm_balance$"))
-    app.add_handler(CallbackQueryHandler(adm_rate,         pattern="^adm_rate$"))
-    app.add_handler(CallbackQueryHandler(adm_rate_wallet,  pattern="^adm_rate_wallet$"))
+    app.add_handler(CallbackQueryHandler(admin_home,      pattern="^adm_home$"))
+    app.add_handler(CallbackQueryHandler(adm_balance,     pattern="^adm_balance$"))
+    app.add_handler(CallbackQueryHandler(adm_rate,        pattern="^adm_rate$"))
+    app.add_handler(CallbackQueryHandler(adm_rate_wallet, pattern="^adm_rate_wallet$"))
+    app.add_handler(CallbackQueryHandler(adm_access,      pattern="^adm_access$"))
+    app.add_handler(CallbackQueryHandler(adm_ac_issue,    pattern="^adm_ac_issue$"))
 
     # Unknown commands (private only)
     app.add_handler(MessageHandler(filters.COMMAND & filters.ChatType.PRIVATE, unknown_command))

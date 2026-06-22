@@ -1951,155 +1951,111 @@ def main() -> None:
         allow_reentry=True,
     )
 
-    # Admin: User Info
-    admin_userinfo_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(adm_userinfo_prompt, pattern="^adm_userinfo$")],
-        states={
-            ADM_USERINFO_QUERY: [MessageHandler(filters.TEXT & ~filters.COMMAND, adm_userinfo_lookup)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel), CallbackQueryHandler(admin_home, pattern="^adm_home$")],
-        allow_reentry=True,
-    )
-
-    # Admin: Wallet Limit
-    admin_wlimit_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(adm_wlimit_prompt, pattern="^adm_wlimit$")],
-        states={
-            ADM_SET_LIMIT_VAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, adm_wlimit_set)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel), CallbackQueryHandler(admin_home, pattern="^adm_home$")],
-        allow_reentry=True,
-    )
-
-    # Admin: CSV Rate
-    admin_rate_csv_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(adm_rate_csv_prompt, pattern="^adm_rate_csv$")],
-        states={
-            ADM_SET_RATE_CSV_VAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, adm_rate_csv_set)],
-        },
-        fallbacks=[
-            CommandHandler("cancel", cancel),
-            CallbackQueryHandler(adm_rate_wallet, pattern="^adm_rate_wallet$"),
-            CallbackQueryHandler(adm_rate,        pattern="^adm_rate$"),
-            CallbackQueryHandler(admin_home,       pattern="^adm_home$"),
-        ],
-        allow_reentry=True,
-    )
-
-    # Admin: TG Rate
-    admin_rate_tg_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(adm_rate_tg_prompt, pattern="^adm_rate_tg$")],
-        states={
-            ADM_SET_RATE_TG_VAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, adm_rate_tg_set)],
-        },
-        fallbacks=[
-            CommandHandler("cancel", cancel),
-            CallbackQueryHandler(adm_rate_wallet, pattern="^adm_rate_wallet$"),
-            CallbackQueryHandler(adm_rate,        pattern="^adm_rate$"),
-            CallbackQueryHandler(admin_home,       pattern="^adm_home$"),
-        ],
-        allow_reentry=True,
-    )
-
-    # Admin: Add User Balance
-    admin_add_bal_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(adm_bal_add_prompt, pattern="^adm_bal_add$")],
-        states={
-            ADM_ADD_BAL_UID: [MessageHandler(filters.TEXT & ~filters.COMMAND, adm_bal_add_uid)],
-            ADM_ADD_BAL_AMT: [MessageHandler(filters.TEXT & ~filters.COMMAND, adm_bal_add_amt)],
-        },
-        fallbacks=[
-            CommandHandler("cancel", cancel),
-            CallbackQueryHandler(adm_balance, pattern="^adm_balance$"),
-            CallbackQueryHandler(admin_home,  pattern="^adm_home$"),
-        ],
-        allow_reentry=True,
-    )
-
-    # Admin: Join Balance
-    admin_join_bal_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(adm_bal_join_prompt, pattern="^adm_bal_join$")],
-        states={
-            ADM_SET_JOIN_BAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, adm_bal_join_set)],
-        },
-        fallbacks=[
-            CommandHandler("cancel", cancel),
-            CallbackQueryHandler(adm_balance, pattern="^adm_balance$"),
-            CallbackQueryHandler(admin_home,  pattern="^adm_home$"),
-        ],
-        allow_reentry=True,
-    )
-
-    # Admin: Access Management (random flow)
-    # Admin: Access Management (single unified conversation)
-    # Entry: adm_access button -> shows Issue Access Code -> Random or Custom
-    admin_ac_conv = ConversationHandler(
+    # =========================================================================
+    # SINGLE UNIFIED ADMIN CONVERSATION
+    # All admin flows merged into one handler to prevent cross-conv state leaks
+    # =========================================================================
+    admin_conv = ConversationHandler(
         entry_points=[
-            CallbackQueryHandler(adm_access_entry, pattern="^adm_access$"),
+            CallbackQueryHandler(admin_home,           pattern="^adm_home$"),
+            CallbackQueryHandler(adm_userinfo_prompt,  pattern="^adm_userinfo$"),
+            CallbackQueryHandler(adm_wlimit_prompt,    pattern="^adm_wlimit$"),
+            CallbackQueryHandler(adm_rate_csv_prompt,  pattern="^adm_rate_csv$"),
+            CallbackQueryHandler(adm_rate_tg_prompt,   pattern="^adm_rate_tg$"),
+            CallbackQueryHandler(adm_bal_add_prompt,   pattern="^adm_bal_add$"),
+            CallbackQueryHandler(adm_bal_join_prompt,  pattern="^adm_bal_join$"),
+            CallbackQueryHandler(adm_access_entry,     pattern="^adm_access$"),
+            CallbackQueryHandler(adm_orders_entry,     pattern="^adm_orders$"),
         ],
         states={
-            # Screen 1: Access Management overview (Issue / Info / Disable buttons)
-            ADM_AC_CHOOSE_TYPE:  [
-                CallbackQueryHandler(adm_ac_show_issue,   pattern="^adm_ac_issue$"),
-                CallbackQueryHandler(adm_ac_info_prompt,  pattern="^adm_ac_info$"),
-                CallbackQueryHandler(adm_ac_disable_prompt, pattern="^adm_ac_disable$"),
+            # ---- User Info ----
+            ADM_USERINFO_QUERY: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, adm_userinfo_lookup),
+                CallbackQueryHandler(admin_home, pattern="^adm_home$"),
             ],
-            # Screen 2: Issue Access Code (Random / Custom buttons)
+            # ---- Wallet Limit ----
+            ADM_SET_LIMIT_VAL: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, adm_wlimit_set),
+                CallbackQueryHandler(admin_home, pattern="^adm_home$"),
+            ],
+            # ---- CSV Rate ----
+            ADM_SET_RATE_CSV_VAL: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, adm_rate_csv_set),
+                CallbackQueryHandler(adm_rate_wallet, pattern="^adm_rate_wallet$"),
+                CallbackQueryHandler(adm_rate,        pattern="^adm_rate$"),
+                CallbackQueryHandler(admin_home,      pattern="^adm_home$"),
+            ],
+            # ---- TG Rate ----
+            ADM_SET_RATE_TG_VAL: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, adm_rate_tg_set),
+                CallbackQueryHandler(adm_rate_wallet, pattern="^adm_rate_wallet$"),
+                CallbackQueryHandler(adm_rate,        pattern="^adm_rate$"),
+                CallbackQueryHandler(admin_home,      pattern="^adm_home$"),
+            ],
+            # ---- Add Balance ----
+            ADM_ADD_BAL_UID: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, adm_bal_add_uid),
+                CallbackQueryHandler(adm_balance, pattern="^adm_balance$"),
+                CallbackQueryHandler(admin_home,  pattern="^adm_home$"),
+            ],
+            ADM_ADD_BAL_AMT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, adm_bal_add_amt),
+                CallbackQueryHandler(adm_balance, pattern="^adm_balance$"),
+                CallbackQueryHandler(admin_home,  pattern="^adm_home$"),
+            ],
+            # ---- Join Balance ----
+            ADM_SET_JOIN_BAL: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, adm_bal_join_set),
+                CallbackQueryHandler(adm_balance, pattern="^adm_balance$"),
+                CallbackQueryHandler(admin_home,  pattern="^adm_home$"),
+            ],
+            # ---- Access Management ----
+            ADM_AC_CHOOSE_TYPE: [
+                CallbackQueryHandler(adm_ac_show_issue,       pattern="^adm_ac_issue$"),
+                CallbackQueryHandler(adm_ac_info_prompt,      pattern="^adm_ac_info$"),
+                CallbackQueryHandler(adm_ac_disable_prompt,   pattern="^adm_ac_disable$"),
+                CallbackQueryHandler(admin_home,              pattern="^adm_home$"),
+            ],
             ADM_AC_ISSUE_SCREEN: [
                 CallbackQueryHandler(adm_ac_random_start, pattern="^adm_ac_random$"),
                 CallbackQueryHandler(adm_ac_custom_start, pattern="^adm_ac_custom$"),
                 CallbackQueryHandler(adm_access_entry,    pattern="^adm_access$"),
+                CallbackQueryHandler(admin_home,          pattern="^adm_home$"),
             ],
-            # Screen 3a: Random - waiting for slot count
             ADM_AC_RANDOM_COUNT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, adm_ac_random_count),
-                # Handle back button pressed while waiting for slot count
                 CallbackQueryHandler(adm_ac_show_issue, pattern="^adm_ac_issue$"),
+                CallbackQueryHandler(admin_home,        pattern="^adm_home$"),
             ],
-            # Screen 3b: Custom - collecting UIDs
-            ADM_AC_CUSTOM_UID:   [
+            ADM_AC_CUSTOM_UID: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, adm_ac_custom_uid),
                 CallbackQueryHandler(adm_ac_custom_done, pattern="^adm_ac_custom_done$"),
-                # Handle back button pressed while entering UIDs
-                CallbackQueryHandler(adm_ac_show_issue, pattern="^adm_ac_issue$"),
+                CallbackQueryHandler(adm_ac_show_issue,  pattern="^adm_ac_issue$"),
+                CallbackQueryHandler(admin_home,         pattern="^adm_home$"),
             ],
-            # Screen 4: Hourly or Days
-            ADM_AC_VAL_TYPE2:    [
-                CallbackQueryHandler(adm_ac_val_type, pattern="^adm_ac_val_(hourly|days)$"),
-                # Handle back button
+            ADM_AC_VAL_TYPE2: [
+                CallbackQueryHandler(adm_ac_val_type,   pattern="^adm_ac_val_(hourly|days)$"),
                 CallbackQueryHandler(adm_ac_show_issue, pattern="^adm_ac_issue$"),
+                CallbackQueryHandler(admin_home,        pattern="^adm_home$"),
             ],
-            # Screen 5: Amount input -> generates code
-            ADM_AC_VAL_AMT2:     [
+            ADM_AC_VAL_AMT2: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, adm_ac_val_amt),
-                # Handle back button: go back to Hourly/Days selection
                 CallbackQueryHandler(adm_ac_val_type_back, pattern="^adm_ac_val_back$"),
+                CallbackQueryHandler(admin_home,           pattern="^adm_home$"),
             ],
-            # Access Code Info: waiting for code input
-            ADM_AC_INFO_QUERY:   [
+            ADM_AC_INFO_QUERY: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, adm_ac_info_lookup),
-                CallbackQueryHandler(adm_ac_info_prompt,    pattern="^adm_ac_info$"),
-                CallbackQueryHandler(adm_access_entry,      pattern="^adm_access$"),
+                CallbackQueryHandler(adm_ac_info_prompt, pattern="^adm_ac_info$"),
+                CallbackQueryHandler(adm_access_entry,   pattern="^adm_access$"),
+                CallbackQueryHandler(admin_home,         pattern="^adm_home$"),
             ],
-            # Disable Access Code: waiting for code input
             ADM_AC_DISABLE_QUERY: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, adm_ac_disable_exec),
                 CallbackQueryHandler(adm_ac_disable_prompt, pattern="^adm_ac_disable$"),
                 CallbackQueryHandler(adm_access_entry,      pattern="^adm_access$"),
+                CallbackQueryHandler(admin_home,            pattern="^adm_home$"),
             ],
-        },
-        fallbacks=[
-            CommandHandler("cancel", cancel),
-            CallbackQueryHandler(adm_access_entry, pattern="^adm_access$"),
-            CallbackQueryHandler(admin_home,        pattern="^adm_home$"),
-        ],
-        allow_reentry=True,
-    )
-
-    # Admin: Order Management
-    admin_orders_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(adm_orders_entry, pattern="^adm_orders$")],
-        states={
+            # ---- Order Management ----
             ADM_ORDER_MENU: [
                 CallbackQueryHandler(adm_order_info_prompt,  pattern="^adm_order_info$"),
                 CallbackQueryHandler(adm_order_user_prompt,  pattern="^adm_order_user$"),
@@ -2109,31 +2065,25 @@ def main() -> None:
                 MessageHandler(filters.TEXT & ~filters.COMMAND, adm_order_info_lookup),
                 CallbackQueryHandler(adm_order_info_prompt,  pattern="^adm_order_info$"),
                 CallbackQueryHandler(adm_orders_entry,       pattern="^adm_orders$"),
+                CallbackQueryHandler(admin_home,             pattern="^adm_home$"),
             ],
             ADM_ORDER_USER_QUERY: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, adm_order_user_lookup),
                 CallbackQueryHandler(adm_order_user_prompt,  pattern="^adm_order_user$"),
                 CallbackQueryHandler(adm_orders_entry,       pattern="^adm_orders$"),
+                CallbackQueryHandler(admin_home,             pattern="^adm_home$"),
             ],
         },
         fallbacks=[
             CommandHandler("cancel", cancel),
-            CallbackQueryHandler(adm_orders_entry, pattern="^adm_orders$"),
-            CallbackQueryHandler(admin_home,       pattern="^adm_home$"),
+            CallbackQueryHandler(admin_home, pattern="^adm_home$"),
         ],
         allow_reentry=True,
     )
 
     # Register conversations (order matters)
     app.add_handler(user_conv)
-    app.add_handler(admin_userinfo_conv)
-    app.add_handler(admin_wlimit_conv)
-    app.add_handler(admin_rate_csv_conv)
-    app.add_handler(admin_rate_tg_conv)
-    app.add_handler(admin_add_bal_conv)
-    app.add_handler(admin_join_bal_conv)
-    app.add_handler(admin_ac_conv)
-    app.add_handler(admin_orders_conv)
+    app.add_handler(admin_conv)
 
     # Commands
     app.add_handler(CommandHandler("help",   help_command))

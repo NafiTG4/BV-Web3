@@ -169,15 +169,15 @@ def _make_order_id() -> str:
             return oid
 
 def create_order(uid: int, count: int, word_count: int, export_type: str, cost: float) -> str:
-    """Create and store a new order, return the order ID."""
+    """Create and store a new order with processing status, return the order ID."""
     oid = _make_order_id()
     ORDER_DB[oid] = {
         "uid":         uid,
         "count":       count,
         "word_count":  word_count,
-        "export_type": export_type,   # "exp_csv" or "exp_tg"
+        "export_type": export_type,
         "cost":        cost,
-        "status":      "completed",
+        "status":      "processing",
         "created_at":  time.time(),
     }
     return oid
@@ -797,6 +797,9 @@ async def receive_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         context.user_data.clear()
         return ConversationHandler.END
 
+    # Create order immediately on confirm with "processing" status
+    order_id = create_order(uid, count, word_count, export_type, required)
+
     export_label = "CSV file" if export_type == "exp_csv" else "TG messages"
     est          = eta_string(count)
 
@@ -806,7 +809,8 @@ async def receive_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         f"\\- Derivation: `{escape_md(DERIVATION_PATH)}`\n"
         f"\\- Export as: `{escape_md(export_label)}`\n"
         f"\\- Estimated time: `{escape_md(est)}`\n"
-        f"\\- Cost: `{escape_md(fmt_pts(required))}` PTS\n\n"
+        f"\\- Cost: `{escape_md(fmt_pts(required))}` PTS\n"
+        f"\\- Order ID: `{escape_md(order_id)}`\n\n"
         "_Please wait \\- this happens automatically\\._",
         parse_mode=ParseMode.MARKDOWN_V2,
     ))
@@ -815,6 +819,7 @@ async def receive_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         rows, actual_secs = await asyncio.to_thread(_generate_wallets, count, word_count)
     except Exception as exc:
         logger.exception("Wallet generation failed: %s", exc)
+        ORDER_DB[order_id]["status"] = "failed"
         await send_safe(query.message.reply_text(
             "\u274c *Generation failed*\n\nAn unexpected error occurred\\. "
             "Please try again with /start\\.",
@@ -823,10 +828,10 @@ async def receive_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         context.user_data.clear()
         return ConversationHandler.END
 
-    # Deduct PTS and record order
+    # Deduct PTS and mark order completed
     user["credits"]           -= required
     user["wallets_generated"] += count
-    order_id = create_order(uid, count, word_count, export_type, required)
+    ORDER_DB[order_id]["status"] = "completed"
 
     elapsed = f"{actual_secs:.1f}s" if actual_secs < 60 else f"{actual_secs / 60:.1f} min"
 

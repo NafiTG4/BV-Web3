@@ -1413,10 +1413,37 @@ async def adm_ac_val_type(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await send_safe(query.edit_message_text(
         f"*Validation Amount*\n\n"
         f"How many *{escape_md(unit)}* should this code be valid for?\n"
-        "_Send a number, e.g. `24`_",
+        "_Send a number, e\\.g\\. `24`_",
         parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("⬅️ Back", callback_data="adm_ac_val_back"),
+        ]]),
     ))
     return ADM_AC_VAL_AMT2
+
+async def adm_ac_val_type_back(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Back button from amount input: re-show the Hourly/Days selection."""
+    query = update.callback_query
+    await query.answer()
+    ac_type  = context.user_data.get("ac_type", "random")
+    if ac_type == "random":
+        slots = context.user_data.get("ac_slots", 1)
+        detail = escape_md(f"{slots} slot(s) set.")
+    else:
+        uid_list = context.user_data.get("ac_custom_uids", [])
+        detail   = escape_md(f"{len(uid_list)} user(s) added.")
+    await send_safe(query.edit_message_text(
+        "*Set Validation Period*\n"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
+        f"`{detail}`\n\n"
+        "How long should this code be valid?",
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("⏰ Hourly", callback_data="adm_ac_val_hourly"),
+            InlineKeyboardButton("📅 Days",   callback_data="adm_ac_val_days"),
+        ]]),
+    ))
+    return ADM_AC_VAL_TYPE2
 
 async def adm_ac_val_amt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not is_admin_group(update):
@@ -1476,7 +1503,8 @@ async def adm_ac_val_amt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         "Share this code with your users\\.",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("🎫 Issue Another", callback_data="adm_ac_issue"),
+            # adm_access re-enters the conversation from the top
+            InlineKeyboardButton("🎫 Issue Another", callback_data="adm_access"),
             InlineKeyboardButton("⬅️ Back",          callback_data="adm_home"),
         ]]),
     ))
@@ -1649,19 +1677,27 @@ def main() -> None:
             # Screen 3a: Random - waiting for slot count
             ADM_AC_RANDOM_COUNT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, adm_ac_random_count),
+                # Handle back button pressed while waiting for slot count
+                CallbackQueryHandler(adm_ac_show_issue, pattern="^adm_ac_issue$"),
             ],
             # Screen 3b: Custom - collecting UIDs
             ADM_AC_CUSTOM_UID:   [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, adm_ac_custom_uid),
                 CallbackQueryHandler(adm_ac_custom_done, pattern="^adm_ac_custom_done$"),
+                # Handle back button pressed while entering UIDs
+                CallbackQueryHandler(adm_ac_show_issue, pattern="^adm_ac_issue$"),
             ],
             # Screen 4: Hourly or Days
             ADM_AC_VAL_TYPE2:    [
                 CallbackQueryHandler(adm_ac_val_type, pattern="^adm_ac_val_(hourly|days)$"),
+                # Handle back button
+                CallbackQueryHandler(adm_ac_show_issue, pattern="^adm_ac_issue$"),
             ],
             # Screen 5: Amount input -> generates code
             ADM_AC_VAL_AMT2:     [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, adm_ac_val_amt),
+                # Handle back button: go back to Hourly/Days selection
+                CallbackQueryHandler(adm_ac_val_type_back, pattern="^adm_ac_val_back$"),
             ],
         },
         fallbacks=[

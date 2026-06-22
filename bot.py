@@ -113,6 +113,7 @@ ADM_AC_VAL_TYPE         = 21
 ADM_AC_VAL_AMT          = 22
 ADM_AC_CUSTOM_UID       = 23
 ADM_AC_CHOOSE_TYPE      = 24  # choose Random or Custom
+ADM_AC_ISSUE_SCREEN     = 27  # Issue Access Code screen (Random/Custom buttons)
 ADM_AC_VAL_TYPE2        = 25  # validation type (unified)
 ADM_AC_VAL_AMT2         = 26  # validation amount (unified)
 
@@ -1281,7 +1282,7 @@ async def adm_ac_show_issue(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             [InlineKeyboardButton("\u2b05\ufe0f Back",     callback_data="adm_access")],
         ]),
     ))
-    return ADM_AC_CHOOSE_TYPE
+    return ADM_AC_ISSUE_SCREEN
 
 # Keep old name as alias so fallback patterns still work
 adm_access = adm_access_entry
@@ -1635,21 +1636,30 @@ def main() -> None:
             CallbackQueryHandler(adm_access_entry, pattern="^adm_access$"),
         ],
         states={
+            # Screen 1: Access Management overview (Issue button)
             ADM_AC_CHOOSE_TYPE:  [
+                CallbackQueryHandler(adm_ac_show_issue, pattern="^adm_ac_issue$"),
+            ],
+            # Screen 2: Issue Access Code (Random / Custom buttons)
+            ADM_AC_ISSUE_SCREEN: [
                 CallbackQueryHandler(adm_ac_random_start, pattern="^adm_ac_random$"),
                 CallbackQueryHandler(adm_ac_custom_start, pattern="^adm_ac_custom$"),
-                CallbackQueryHandler(adm_ac_show_issue,   pattern="^adm_ac_issue$"),
+                CallbackQueryHandler(adm_access_entry,    pattern="^adm_access$"),
             ],
+            # Screen 3a: Random - waiting for slot count
             ADM_AC_RANDOM_COUNT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, adm_ac_random_count),
             ],
+            # Screen 3b: Custom - collecting UIDs
             ADM_AC_CUSTOM_UID:   [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, adm_ac_custom_uid),
                 CallbackQueryHandler(adm_ac_custom_done, pattern="^adm_ac_custom_done$"),
             ],
+            # Screen 4: Hourly or Days
             ADM_AC_VAL_TYPE2:    [
                 CallbackQueryHandler(adm_ac_val_type, pattern="^adm_ac_val_(hourly|days)$"),
             ],
+            # Screen 5: Amount input -> generates code
             ADM_AC_VAL_AMT2:     [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, adm_ac_val_amt),
             ],

@@ -116,6 +116,8 @@ ADM_AC_CHOOSE_TYPE      = 24  # choose Random or Custom
 ADM_AC_ISSUE_SCREEN     = 27  # Issue Access Code screen (Random/Custom buttons)
 ADM_AC_VAL_TYPE2        = 25  # validation type (unified)
 ADM_AC_VAL_AMT2         = 26  # validation amount (unified)
+ADM_AC_INFO_QUERY       = 28  # waiting for code to show info
+ADM_AC_DISABLE_QUERY    = 29  # waiting for code to disable
 
 # ============================================================================
 # USER STORE
@@ -1261,8 +1263,12 @@ async def adm_access_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         "Select an action\\:",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("\U0001f3ab Issue Access Code", callback_data="adm_ac_issue")],
-            [InlineKeyboardButton("\u2b05\ufe0f Back",           callback_data="adm_home")],
+            [InlineKeyboardButton("\U0001f3ab Issue Access Code",   callback_data="adm_ac_issue")],
+            [
+                InlineKeyboardButton("\U0001f4cb Access Code Info",    callback_data="adm_ac_info"),
+                InlineKeyboardButton("\U0001f6ab Disable Access Code", callback_data="adm_ac_disable"),
+            ],
+            [InlineKeyboardButton("\u2b05\ufe0f Back",             callback_data="adm_home")],
         ]),
     ))
     return ADM_AC_CHOOSE_TYPE
@@ -1307,9 +1313,6 @@ async def adm_ac_random_start(update: Update, context: ContextTypes.DEFAULT_TYPE
     return ADM_AC_RANDOM_COUNT
 
 async def adm_ac_random_count(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not is_admin_group(update):
-        return ADM_AC_RANDOM_COUNT
-
     text = update.message.text.strip()
     if not text.isdigit() or int(text) < 1:
         await send_safe(update.message.reply_text(
@@ -1319,10 +1322,11 @@ async def adm_ac_random_count(update: Update, context: ContextTypes.DEFAULT_TYPE
         return ADM_AC_RANDOM_COUNT
 
     context.user_data["ac_slots"] = int(text)
+    slots_display = escape_md(str(context.user_data["ac_slots"]))
     await send_safe(update.message.reply_text(
         "*Set Validation Period*\n"
         "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
-        f"`{context.user_data['ac_slots']}` slot\\(s\\) set\\.\n\n"
+        f"`{slots_display}` slot\\(s\\) set\\.\n\n"
         "How long should this code be valid?",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=InlineKeyboardMarkup([[
@@ -1351,9 +1355,6 @@ async def adm_ac_custom_start(update: Update, context: ContextTypes.DEFAULT_TYPE
     return ADM_AC_CUSTOM_UID
 
 async def adm_ac_custom_uid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not is_admin_group(update):
-        return ADM_AC_CUSTOM_UID
-
     text = update.message.text.strip()
     if not text.isdigit():
         await send_safe(update.message.reply_text(
@@ -1446,9 +1447,6 @@ async def adm_ac_val_type_back(update: Update, context: ContextTypes.DEFAULT_TYP
     return ADM_AC_VAL_TYPE2
 
 async def adm_ac_val_amt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not is_admin_group(update):
-        return ADM_AC_VAL_AMT2
-
     text = update.message.text.strip()
     if not text.isdigit() or int(text) < 1:
         await send_safe(update.message.reply_text(
@@ -1510,6 +1508,140 @@ async def adm_ac_val_amt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     ))
     context.user_data.clear()
     return ConversationHandler.END
+
+# ---- ACCESS CODE INFO -------------------------------------------------------
+async def adm_ac_info_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    await send_safe(query.edit_message_text(
+        "*\U0001f4cb Access Code Info*\n"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
+        "Send the *access code* to look up\\.",
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("⬅️ Back", callback_data="adm_access"),
+        ]]),
+    ))
+    return ADM_AC_INFO_QUERY
+
+async def adm_ac_info_lookup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    code  = update.message.text.strip().upper()
+    entry = ACCESS_CODES.get(code)
+
+    if entry is None:
+        await send_safe(update.message.reply_text(
+            f"\u26a0\ufe0f Code `{escape_md(code)}` not found or already expired\\.",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        ))
+        return ADM_AC_INFO_QUERY
+
+    now       = time.time()
+    is_active = entry["expires_at"] > now
+    exp_dt    = datetime.utcfromtimestamp(entry["expires_at"]).strftime("%Y-%m-%d %H:%M UTC")
+    status    = "\u2705 Active" if is_active else "\u274c Expired"
+
+    # Build used-users list
+    used_uids = entry.get("used_uids", set())
+    if used_uids:
+        lines = []
+        for uid in used_uids:
+            u = USER_DB.get(uid)
+            if u:
+                name = escape_md(u["name"] or str(uid))
+                uname = escape_md("@" + u["username"] if u["username"] else "N/A")
+                lines.append(f"  \u2022 `{uid}` \\| {name} \\| {uname}")
+            else:
+                lines.append(f"  \u2022 `{uid}` \\| _unknown user_")
+        users_text = "\n".join(lines)
+    else:
+        users_text = "  _No one has used this code yet\\._"
+
+    code_type   = escape_md(entry["type"].capitalize())
+    slots_left  = escape_md(str(entry.get("slots", 0)))
+    total_used  = escape_md(str(len(used_uids)))
+
+    await send_safe(update.message.reply_text(
+        f"*\U0001f4cb Code Info: `{escape_md(code)}`*\n"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
+        f"*Status:* {status}\n"
+        f"*Type:* `{code_type}`\n"
+        f"*Expires:* `{escape_md(exp_dt)}`\n"
+        f"*Slots remaining:* `{slots_left}`\n"
+        f"*Times used:* `{total_used}`\n\n"
+        f"*Users who used this code \\({total_used}\\):*\n"
+        f"{users_text}",
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔍 Look up another", callback_data="adm_ac_info"),
+            InlineKeyboardButton("⬅️ Back",            callback_data="adm_access"),
+        ]]),
+    ))
+    return ADM_AC_INFO_QUERY
+
+# ---- DISABLE ACCESS CODE ----------------------------------------------------
+async def adm_ac_disable_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    await send_safe(query.edit_message_text(
+        "*\U0001f6ab Disable Access Code*\n"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
+        "Send the *access code* to disable\\.\n\n"
+        "\u26a0\ufe0f All users who redeemed this code will *immediately lose access*\\.",
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("⬅️ Back", callback_data="adm_access"),
+        ]]),
+    ))
+    return ADM_AC_DISABLE_QUERY
+
+async def adm_ac_disable_exec(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    code  = update.message.text.strip().upper()
+    entry = ACCESS_CODES.get(code)
+
+    if entry is None:
+        await send_safe(update.message.reply_text(
+            f"\u26a0\ufe0f Code `{escape_md(code)}` not found or already expired\\.",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        ))
+        return ADM_AC_DISABLE_QUERY
+
+    # Collect affected users before deleting
+    used_uids   = set(entry.get("used_uids", set()))
+    revoked_cnt = 0
+
+    # Remove from GRANTED_USERS immediately
+    for uid in used_uids:
+        if uid in GRANTED_USERS:
+            del GRANTED_USERS[uid]
+            revoked_cnt += 1
+
+    # Delete the code
+    del ACCESS_CODES[code]
+
+    # Build revoked user list for display
+    if used_uids:
+        lines = []
+        for uid in used_uids:
+            u = USER_DB.get(uid)
+            name = escape_md(u["name"] if u else str(uid))
+            lines.append(f"  \u2022 `{uid}` \\| {name}")
+        revoked_text = "\n".join(lines)
+    else:
+        revoked_text = "  _No users were using this code\\._"
+
+    await send_safe(update.message.reply_text(
+        f"\U0001f6ab *Access Code Disabled\\!*\n"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
+        f"*Code:* `{escape_md(code)}`\n"
+        f"*Users revoked:* `{revoked_cnt}`\n\n"
+        f"*Affected users:*\n{revoked_text}",
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🚫 Disable Another", callback_data="adm_ac_disable"),
+            InlineKeyboardButton("⬅️ Back",            callback_data="adm_access"),
+        ]]),
+    ))
+    return ADM_AC_DISABLE_QUERY
 
 # ============================================================================
 # CANCEL / FALLBACK
@@ -1664,9 +1796,11 @@ def main() -> None:
             CallbackQueryHandler(adm_access_entry, pattern="^adm_access$"),
         ],
         states={
-            # Screen 1: Access Management overview (Issue button)
+            # Screen 1: Access Management overview (Issue / Info / Disable buttons)
             ADM_AC_CHOOSE_TYPE:  [
-                CallbackQueryHandler(adm_ac_show_issue, pattern="^adm_ac_issue$"),
+                CallbackQueryHandler(adm_ac_show_issue,   pattern="^adm_ac_issue$"),
+                CallbackQueryHandler(adm_ac_info_prompt,  pattern="^adm_ac_info$"),
+                CallbackQueryHandler(adm_ac_disable_prompt, pattern="^adm_ac_disable$"),
             ],
             # Screen 2: Issue Access Code (Random / Custom buttons)
             ADM_AC_ISSUE_SCREEN: [
@@ -1698,6 +1832,18 @@ def main() -> None:
                 MessageHandler(filters.TEXT & ~filters.COMMAND, adm_ac_val_amt),
                 # Handle back button: go back to Hourly/Days selection
                 CallbackQueryHandler(adm_ac_val_type_back, pattern="^adm_ac_val_back$"),
+            ],
+            # Access Code Info: waiting for code input
+            ADM_AC_INFO_QUERY:   [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, adm_ac_info_lookup),
+                CallbackQueryHandler(adm_ac_info_prompt,    pattern="^adm_ac_info$"),
+                CallbackQueryHandler(adm_access_entry,      pattern="^adm_access$"),
+            ],
+            # Disable Access Code: waiting for code input
+            ADM_AC_DISABLE_QUERY: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, adm_ac_disable_exec),
+                CallbackQueryHandler(adm_ac_disable_prompt, pattern="^adm_ac_disable$"),
+                CallbackQueryHandler(adm_access_entry,      pattern="^adm_access$"),
             ],
         },
         fallbacks=[

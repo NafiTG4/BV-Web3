@@ -99,6 +99,7 @@ USER_ENTER_CODE         = 1
 ASK_COUNT               = 2
 ASK_WORDS               = 3
 ASK_EXPORT              = 4
+ASK_CONFIRM             = 5   # order summary confirmation screen
 
 ADM_USERINFO_QUERY      = 10
 ADM_SET_LIMIT_VAL       = 11
@@ -118,6 +119,10 @@ ADM_AC_VAL_TYPE2        = 25  # validation type (unified)
 ADM_AC_VAL_AMT2         = 26  # validation amount (unified)
 ADM_AC_INFO_QUERY       = 28  # waiting for code to show info
 ADM_AC_DISABLE_QUERY    = 29  # waiting for code to disable
+
+ADM_ORDER_MENU          = 30  # order management sub-menu
+ADM_ORDER_ID_QUERY      = 31  # waiting for order id input
+ADM_ORDER_USER_QUERY    = 32  # waiting for user tg id input
 
 # ============================================================================
 # USER STORE
@@ -150,7 +155,33 @@ def find_user(q: str) -> tuple:
     return None, None
 
 # ============================================================================
-# ACCESS CODE STORE
+# ORDER STORE
+# order_id -> {uid, count, word_count, export_type, cost, status, created_at}
+# ============================================================================
+ORDER_DB: dict[str, dict] = {}
+
+def _make_order_id() -> str:
+    """Generate a unique 10-char alphanumeric order ID."""
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    while True:
+        oid = "ORD-" + "".join(secrets.choice(alphabet) for _ in range(8))
+        if oid not in ORDER_DB:
+            return oid
+
+def create_order(uid: int, count: int, word_count: int, export_type: str, cost: float) -> str:
+    """Create and store a new order, return the order ID."""
+    oid = _make_order_id()
+    ORDER_DB[oid] = {
+        "uid":         uid,
+        "count":       count,
+        "word_count":  word_count,
+        "export_type": export_type,   # "exp_csv" or "exp_tg"
+        "cost":        cost,
+        "status":      "completed",
+        "created_at":  time.time(),
+    }
+    return oid
+
 # code -> {type, slots, allowed_uids, used_uids, expires_at}
 # ============================================================================
 ACCESS_CODES: dict[str, dict]  = {}
@@ -341,6 +372,7 @@ def admin_menu_kb() -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton("🔐 Access Management",     callback_data="adm_access"),
+            InlineKeyboardButton("🧾 Order ID",              callback_data="adm_orders"),
         ],
     ])
 
@@ -706,8 +738,67 @@ async def receive_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         context.user_data.clear()
         return ConversationHandler.END
 
+    # Store export type and show order summary for confirmation
+    context.user_data["export_type"] = export_type
+    export_label = "CSV File" if export_type == "exp_csv" else "TG Messages"
     est          = eta_string(count)
+
+    await send_safe(query.edit_message_text(
+        "\U0001f4cb *Order Summary*\n"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
+        f"*Wallets:* `{escape_md(fmt(count))}`\n"
+        f"*Mnemonic:* `{word_count} words`\n"
+        f"*Derivation:* `{escape_md(DERIVATION_PATH)}`\n"
+        f"*Export as:* `{escape_md(export_label)}`\n"
+        f"*Est\\. time:* `{escape_md(est)}`\n\n"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+        f"*Cost:* `{escape_md(fmt_pts(required))}` PTS\n"
+        f"*Your balance:* `{escape_md(fmt_pts(user['credits']))}` PTS\n"
+        f"*After order:* `{escape_md(fmt_pts(user['credits'] - required))}` PTS\n\n"
+        "Confirm to start generation\\.",
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Confirm Order", callback_data="order_confirm"),
+                InlineKeyboardButton("❌ Cancel",        callback_data="menu_home"),
+            ],
+        ]),
+    ))
+    return ASK_CONFIRM
+
+async def receive_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """User confirmed the order -- generate wallets and record the order."""
+    query = update.callback_query
+    await query.answer()
+
+    count       = context.user_data.get("count")
+    word_count  = context.user_data.get("word_count")
+    export_type = context.user_data.get("export_type")
+
+    if not count or not word_count or not export_type:
+        await send_safe(query.edit_message_text(
+            "Session expired\\. Use /start to begin again\\.",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        ))
+        return ConversationHandler.END
+
+    uid      = update.effective_user.id
+    user     = get_user(uid)
+    required = cost_for(count, export_type)
+
+    # Re-check balance (edge case: balance changed between summary and confirm)
+    if user["credits"] < required:
+        await send_safe(query.edit_message_text(
+            "\u274c *Insufficient Credits*\n\n"
+            "Your balance changed\\. Please contact an admin\\.",
+            parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=back_kb(),
+        ))
+        context.user_data.clear()
+        return ConversationHandler.END
+
     export_label = "CSV file" if export_type == "exp_csv" else "TG messages"
+    est          = eta_string(count)
 
     await send_safe(query.edit_message_text(
         f"\u2699\ufe0f *Generating {escape_md(fmt(count))} wallets\\.\\.\\.*\n\n"
@@ -732,9 +823,10 @@ async def receive_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         context.user_data.clear()
         return ConversationHandler.END
 
-    # Deduct PTS after successful generation
+    # Deduct PTS and record order
     user["credits"]           -= required
     user["wallets_generated"] += count
+    order_id = create_order(uid, count, word_count, export_type, required)
 
     elapsed = f"{actual_secs:.1f}s" if actual_secs < 60 else f"{actual_secs / 60:.1f} min"
 
@@ -747,6 +839,7 @@ async def receive_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     remaining = escape_md(fmt_pts(user["credits"]))
     await send_safe(query.message.reply_text(
         "\U0001f3c1 *All done\\!*\n\n"
+        f"\U0001f4dd *Order ID:* `{escape_md(order_id)}`\n"
         f"\U0001f4b3 *Remaining Credit:* `{remaining}` PTS\n\n"
         "Need another batch? Use /start anytime\\.",
         parse_mode=ParseMode.MARKDOWN_V2,
@@ -1644,6 +1737,149 @@ async def adm_ac_disable_exec(update: Update, context: ContextTypes.DEFAULT_TYPE
     return ADM_AC_DISABLE_QUERY
 
 # ============================================================================
+# ADMIN: ORDER MANAGEMENT
+# ============================================================================
+async def adm_orders_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    total = len(ORDER_DB)
+    await send_safe(query.edit_message_text(
+        "*\U0001f9fe Order Management*\n"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
+        f"Total orders: `{total}`\n\n"
+        "Select an action\\:",
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("\U0001f4cb Order ID Info",       callback_data="adm_order_info"),
+                InlineKeyboardButton("\U0001f464 User Order ID Info",  callback_data="adm_order_user"),
+            ],
+            [InlineKeyboardButton("\u2b05\ufe0f Back", callback_data="adm_home")],
+        ]),
+    ))
+    return ADM_ORDER_MENU
+
+async def adm_order_info_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    await send_safe(query.edit_message_text(
+        "*\U0001f4cb Order ID Info*\n"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
+        "Send the *Order ID* to look up\\.\n"
+        "_Example: `ORD\\-XXXX1234`_",
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("⬅️ Back", callback_data="adm_orders"),
+        ]]),
+    ))
+    return ADM_ORDER_ID_QUERY
+
+async def adm_order_info_lookup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    oid   = update.message.text.strip().upper()
+    order = ORDER_DB.get(oid)
+
+    if order is None:
+        await send_safe(update.message.reply_text(
+            f"\u26a0\ufe0f Order `{escape_md(oid)}` not found\\.",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        ))
+        return ADM_ORDER_ID_QUERY
+
+    uid          = order["uid"]
+    u            = USER_DB.get(uid)
+    name         = escape_md(u["name"] if u else str(uid))
+    username     = escape_md("@" + u["username"] if u and u["username"] else "N/A")
+    export_label = "CSV File" if order["export_type"] == "exp_csv" else "TG Messages"
+    created_dt   = datetime.utcfromtimestamp(order["created_at"]).strftime("%Y-%m-%d %H:%M UTC")
+
+    await send_safe(update.message.reply_text(
+        f"*\U0001f4cb Order Info*\n"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
+        f"*Order ID:* `{escape_md(oid)}`\n"
+        f"*Status:* `{escape_md(order['status'].capitalize())}`\n"
+        f"*Created:* `{escape_md(created_dt)}`\n\n"
+        f"*User:* {name} \\(`{uid}`\\)\n"
+        f"*Username:* {username}\n\n"
+        f"*Wallets:* `{escape_md(fmt(order['count']))}`\n"
+        f"*Mnemonic:* `{order['word_count']} words`\n"
+        f"*Export:* `{escape_md(export_label)}`\n"
+        f"*Cost:* `{escape_md(fmt_pts(order['cost']))}` PTS\n",
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔍 Look up another", callback_data="adm_order_info"),
+            InlineKeyboardButton("⬅️ Back",            callback_data="adm_orders"),
+        ]]),
+    ))
+    return ADM_ORDER_ID_QUERY
+
+async def adm_order_user_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    await send_safe(query.edit_message_text(
+        "*\U0001f464 User Order ID Info*\n"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
+        "Send the user's *Telegram ID* to see all their orders\\.",
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("⬅️ Back", callback_data="adm_orders"),
+        ]]),
+    ))
+    return ADM_ORDER_USER_QUERY
+
+async def adm_order_user_lookup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    if not text.isdigit():
+        await send_safe(update.message.reply_text(
+            "\u26a0\ufe0f Please send a valid numeric Telegram User ID\\.",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        ))
+        return ADM_ORDER_USER_QUERY
+
+    target_uid = int(text)
+    u          = USER_DB.get(target_uid)
+
+    # Collect all orders for this user, sorted newest first
+    user_orders = [
+        (oid, o) for oid, o in ORDER_DB.items() if o["uid"] == target_uid
+    ]
+    user_orders.sort(key=lambda x: x[1]["created_at"], reverse=True)
+
+    if not user_orders:
+        name_str = escape_md(u["name"] if u else str(target_uid))
+        await send_safe(update.message.reply_text(
+            f"\u26a0\ufe0f No orders found for user `{target_uid}` \\({name_str}\\)\\.",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        ))
+        return ADM_ORDER_USER_QUERY
+
+    name     = escape_md(u["name"] if u else str(target_uid))
+    username = escape_md("@" + u["username"] if u and u["username"] else "N/A")
+    lines    = [
+        f"*\U0001f464 Orders for {name}* \\(`{target_uid}`\\)\n"
+        f"Username: {username}\n"
+        f"Total orders: `{len(user_orders)}`\n"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
+    ]
+    for oid, o in user_orders:
+        export_label = "CSV" if o["export_type"] == "exp_csv" else "TG"
+        dt           = datetime.utcfromtimestamp(o["created_at"]).strftime("%Y-%m-%d %H:%M")
+        lines.append(
+            f"\n\U0001f4dd `{escape_md(oid)}`\n"
+            f"  Wallets: `{escape_md(fmt(o['count']))}` \\| {o['word_count']}w \\| {escape_md(export_label)}\n"
+            f"  Cost: `{escape_md(fmt_pts(o['cost']))}` PTS \\| {escape_md(dt)} UTC"
+        )
+
+    await send_safe(update.message.reply_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔍 Look up another user", callback_data="adm_order_user"),
+            InlineKeyboardButton("⬅️ Back",                 callback_data="adm_orders"),
+        ]]),
+    ))
+    return ADM_ORDER_USER_QUERY
+
+# ============================================================================
 # CANCEL / FALLBACK
 # ============================================================================
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1699,8 +1935,9 @@ def main() -> None:
                 filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
                 receive_count,
             )],
-            ASK_WORDS:  [CallbackQueryHandler(receive_words,  pattern=r"^wc_(12|15|18|21|24)$")],
-            ASK_EXPORT: [CallbackQueryHandler(receive_export, pattern="^exp_(csv|tg)$")],
+            ASK_WORDS:  [CallbackQueryHandler(receive_words,   pattern=r"^wc_(12|15|18|21|24)$")],
+            ASK_EXPORT: [CallbackQueryHandler(receive_export,  pattern="^exp_(csv|tg)$")],
+            ASK_CONFIRM:[CallbackQueryHandler(receive_confirm, pattern="^order_confirm$")],
         },
         fallbacks=[
             CommandHandler("cancel", cancel),
@@ -1854,6 +2091,34 @@ def main() -> None:
         allow_reentry=True,
     )
 
+    # Admin: Order Management
+    admin_orders_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(adm_orders_entry, pattern="^adm_orders$")],
+        states={
+            ADM_ORDER_MENU: [
+                CallbackQueryHandler(adm_order_info_prompt,  pattern="^adm_order_info$"),
+                CallbackQueryHandler(adm_order_user_prompt,  pattern="^adm_order_user$"),
+                CallbackQueryHandler(admin_home,             pattern="^adm_home$"),
+            ],
+            ADM_ORDER_ID_QUERY: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, adm_order_info_lookup),
+                CallbackQueryHandler(adm_order_info_prompt,  pattern="^adm_order_info$"),
+                CallbackQueryHandler(adm_orders_entry,       pattern="^adm_orders$"),
+            ],
+            ADM_ORDER_USER_QUERY: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, adm_order_user_lookup),
+                CallbackQueryHandler(adm_order_user_prompt,  pattern="^adm_order_user$"),
+                CallbackQueryHandler(adm_orders_entry,       pattern="^adm_orders$"),
+            ],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            CallbackQueryHandler(adm_orders_entry, pattern="^adm_orders$"),
+            CallbackQueryHandler(admin_home,       pattern="^adm_home$"),
+        ],
+        allow_reentry=True,
+    )
+
     # Register conversations (order matters)
     app.add_handler(user_conv)
     app.add_handler(admin_userinfo_conv)
@@ -1863,6 +2128,7 @@ def main() -> None:
     app.add_handler(admin_add_bal_conv)
     app.add_handler(admin_join_bal_conv)
     app.add_handler(admin_ac_conv)
+    app.add_handler(admin_orders_conv)
 
     # Commands
     app.add_handler(CommandHandler("help",   help_command))

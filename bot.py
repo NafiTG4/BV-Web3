@@ -1304,7 +1304,7 @@ async def adm_ac_random_start(update: Update, context: ContextTypes.DEFAULT_TYPE
         "*\U0001f3b2 Random User Access Code*\n"
         "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
         "How many users can redeem this code?\n"
-        "_Send a number, e.g. `5`_",
+        "_Send a number, e\\.g\\. `5`_",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("⬅️ Back", callback_data="adm_ac_issue")
